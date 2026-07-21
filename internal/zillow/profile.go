@@ -31,13 +31,27 @@ type SearchProfile struct {
 
 // SearchFilters contains optional mutations to a profile's searchQueryState.
 // Zero numeric values leave the corresponding captured value unchanged.
+const (
+	HomeTypeApartment    = "apartment"
+	HomeTypeCondo        = "condo"
+	HomeTypeTownhouse    = "townhouse"
+	HomeTypeSingleFamily = "single-family"
+)
+
+// SearchFilters contains server-side Zillow search-state mutations. Zero
+// numeric values and false booleans leave the captured value unchanged.
 type SearchFilters struct {
-	Page     int
-	MinPrice int64
-	MaxPrice int64
-	MinBeds  float64
-	MinBaths float64
-	Sort     string
+	Page            int
+	MinPrice        int64
+	MaxPrice        int64
+	MinBeds         float64
+	MaxBeds         float64
+	MinBaths        float64
+	Sort            string
+	Keywords        string
+	HomeTypes       []string
+	InUnitLaundry   bool
+	EntirePlaceOnly bool
 }
 
 // LoadSearchProfile decodes and validates one strict SearchProfile JSON object.
@@ -222,7 +236,7 @@ func (p *SearchProfile) ApplyFilters(filters SearchFilters) error {
 		pagination["currentPage"] = filters.Page
 	}
 
-	if filters.MinPrice > 0 || filters.MaxPrice > 0 || filters.MinBeds > 0 || filters.MinBaths > 0 || filters.Sort != "" {
+	if filters.MinPrice > 0 || filters.MaxPrice > 0 || filters.MinBeds > 0 || filters.MaxBeds > 0 || filters.MinBaths > 0 || filters.Sort != "" || filters.Keywords != "" || len(filters.HomeTypes) > 0 || filters.InUnitLaundry || filters.EntirePlaceOnly {
 		filterState, err := ensureObject(p.SearchQueryState, "filterState")
 		if err != nil {
 			return fmt.Errorf("apply search filters: %w", err)
@@ -240,12 +254,17 @@ func (p *SearchProfile) ApplyFilters(filters SearchFilters) error {
 				price["max"] = filters.MaxPrice
 			}
 		}
-		if filters.MinBeds > 0 {
+		if filters.MinBeds > 0 || filters.MaxBeds > 0 {
 			beds, err := ensureObject(filterState, "beds")
 			if err != nil {
 				return fmt.Errorf("apply search filters: filterState.%w", err)
 			}
-			beds["min"] = filters.MinBeds
+			if filters.MinBeds > 0 {
+				beds["min"] = filters.MinBeds
+			}
+			if filters.MaxBeds > 0 {
+				beds["max"] = filters.MaxBeds
+			}
 		}
 		if filters.MinBaths > 0 {
 			baths, err := ensureObject(filterState, "baths")
@@ -261,12 +280,44 @@ func (p *SearchProfile) ApplyFilters(filters SearchFilters) error {
 			}
 			sortSelection["value"] = filters.Sort
 		}
+		if filters.Keywords != "" {
+			keywords, err := ensureObject(filterState, "keywords")
+			if err != nil {
+				return fmt.Errorf("apply search filters: filterState.%w", err)
+			}
+			keywords["value"] = filters.Keywords
+		}
+		if len(filters.HomeTypes) > 0 {
+			selected := make(map[string]bool, len(filters.HomeTypes))
+			for _, homeType := range filters.HomeTypes {
+				selected[homeType] = true
+			}
+			setFilterBool(filterState, "isApartment", selected[HomeTypeApartment])
+			setFilterBool(filterState, "isCondo", selected[HomeTypeCondo])
+			setFilterBool(filterState, "isTownhouse", selected[HomeTypeTownhouse])
+			setFilterBool(filterState, "isSingleFamily", selected[HomeTypeSingleFamily])
+			setFilterBool(filterState, "isApartmentOrCondo", selected[HomeTypeApartment] || selected[HomeTypeCondo])
+			setFilterBool(filterState, "isMultiFamily", false)
+			setFilterBool(filterState, "isManufactured", false)
+			setFilterBool(filterState, "isLotLand", false)
+		}
+		if filters.InUnitLaundry {
+			setFilterBool(filterState, "onlyRentalInUnitLaundry", true)
+		}
+		if filters.EntirePlaceOnly {
+			setFilterBool(filterState, "isEntirePlaceForRent", true)
+			setFilterBool(filterState, "isRoomForRent", false)
+		}
 	}
 
 	if err := validateFinalPriceBounds(p.SearchQueryState); err != nil {
 		return fmt.Errorf("apply search filters: %w", err)
 	}
 	return nil
+}
+
+func setFilterBool(filterState map[string]any, name string, value bool) {
+	filterState[name] = map[string]any{"value": value}
 }
 
 func validateFinalPriceBounds(queryState map[string]any) error {
@@ -313,18 +364,47 @@ func validateSearchFilters(filters SearchFilters) error {
 	if filters.MinPrice > 0 && filters.MaxPrice > 0 && filters.MinPrice > filters.MaxPrice {
 		return errors.New("minimum price must not exceed maximum price")
 	}
-	if math.IsNaN(filters.MinBeds) || math.IsInf(filters.MinBeds, 0) || math.IsNaN(filters.MinBaths) || math.IsInf(filters.MinBaths, 0) {
+	if math.IsNaN(filters.MinBeds) || math.IsInf(filters.MinBeds, 0) || math.IsNaN(filters.MaxBeds) || math.IsInf(filters.MaxBeds, 0) || math.IsNaN(filters.MinBaths) || math.IsInf(filters.MinBaths, 0) {
 		return errors.New("bed and bath filters must be finite")
 	}
-	if filters.MinBeds < 0 || filters.MinBaths < 0 {
+	if filters.MinBeds < 0 || filters.MaxBeds < 0 || filters.MinBaths < 0 {
 		return errors.New("bed and bath filters must not be negative")
+	}
+	if filters.MinBeds > 0 && filters.MaxBeds > 0 && filters.MinBeds > filters.MaxBeds {
+		return errors.New("minimum beds must not exceed maximum beds")
+	}
+	seenHomeTypes := make(map[string]struct{}, len(filters.HomeTypes))
+	for _, homeType := range filters.HomeTypes {
+		if homeType != strings.TrimSpace(homeType) {
+			return errors.New("home type must not have surrounding whitespace")
+		}
+		switch homeType {
+		case HomeTypeApartment, HomeTypeCondo, HomeTypeTownhouse, HomeTypeSingleFamily:
+		default:
+			return fmt.Errorf("unknown home type %q", homeType)
+		}
+		if _, exists := seenHomeTypes[homeType]; exists {
+			return fmt.Errorf("duplicate home type %q", homeType)
+		}
+		seenHomeTypes[homeType] = struct{}{}
 	}
 	if filters.Sort != strings.TrimSpace(filters.Sort) {
 		return errors.New("sort must not have surrounding whitespace")
 	}
+	if filters.Keywords != strings.TrimSpace(filters.Keywords) {
+		return errors.New("keywords must not have surrounding whitespace")
+	}
+	if len(filters.Keywords) > 256 {
+		return errors.New("keywords must not exceed 256 bytes")
+	}
 	for _, r := range filters.Sort {
 		if r < 0x20 || r == 0x7f {
 			return errors.New("sort must not contain control characters")
+		}
+	}
+	for _, r := range filters.Keywords {
+		if r < 0x20 || r == 0x7f {
+			return errors.New("keywords must not contain control characters")
 		}
 	}
 	return nil

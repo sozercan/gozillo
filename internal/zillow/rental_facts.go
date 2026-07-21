@@ -2,6 +2,7 @@ package zillow
 
 import (
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -108,6 +109,12 @@ func populatePropertyRentalFacts(property *Property, raw map[string]any) {
 
 	property.FlexSpaces = classifyFlexSpaces(property.Description, reso, property.Parking)
 	property.DaysOnZillow = int64Pointer(raw, "daysOnZillow")
+	listedDate, updatedDate, derivedDays := rentalHistoryRecency(raw, time.Now().UTC())
+	property.ListedDate = listedDate
+	property.UpdatedDate = updatedDate
+	if property.DaysOnZillow == nil {
+		property.DaysOnZillow = derivedDays
+	}
 	property.Availability = normalizedAvailability(firstNonNil(
 		reso["availabilityDate"],
 		raw["availabilityDate"],
@@ -276,6 +283,80 @@ func structuredFlexMatch(name, text string) bool {
 	default:
 		return containsWord(text, name)
 	}
+}
+
+type rentalHistoryEvent struct {
+	date   time.Time
+	event  string
+	rental bool
+}
+
+func rentalHistoryRecency(raw map[string]any, today time.Time) (string, string, *int64) {
+	items, ok := raw["priceHistory"].([]any)
+	if !ok || len(items) == 0 {
+		return "", "", nil
+	}
+	events := make([]rentalHistoryEvent, 0, len(items))
+	for _, item := range items {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		parsed, ok := parseRentalHistoryDate(entry["date"])
+		if !ok {
+			continue
+		}
+		event := canonicalText(firstString(entry, "event"))
+		rental, _ := boolFromAny(entry["postingIsRental"])
+		if !rental && !strings.Contains(event, "rent") {
+			continue
+		}
+		events = append(events, rentalHistoryEvent{date: parsed, event: event, rental: rental})
+	}
+	if len(events) == 0 {
+		return "", "", nil
+	}
+	sort.Slice(events, func(i, j int) bool { return events[i].date.Before(events[j].date) })
+	var listed time.Time
+	var updated time.Time
+	for _, event := range events {
+		switch {
+		case containsAny(event.event, "listing removed", "removed listing", "off market", "sold", "pending sale"):
+			listed = time.Time{}
+			updated = time.Time{}
+		case containsAny(event.event, "listed for rent", "listed for rental", "rental listing"):
+			listed = event.date
+			updated = event.date
+		case !listed.IsZero() && event.date.After(updated):
+			updated = event.date
+		}
+	}
+	if listed.IsZero() {
+		return "", "", nil
+	}
+	if updated.IsZero() {
+		updated = listed
+	}
+	calendarToday := time.Date(today.Year(), today.Month(), today.Day(), 0, 0, 0, 0, time.UTC)
+	calendarListed := time.Date(listed.Year(), listed.Month(), listed.Day(), 0, 0, 0, 0, time.UTC)
+	difference := int64(calendarToday.Sub(calendarListed) / (24 * time.Hour))
+	if difference < 0 {
+		return listed.Format("2006-01-02"), updated.Format("2006-01-02"), nil
+	}
+	return listed.Format("2006-01-02"), updated.Format("2006-01-02"), &difference
+}
+
+func parseRentalHistoryDate(value any) (time.Time, bool) {
+	text, ok := stringFromAny(value)
+	if !ok || text == "" {
+		return time.Time{}, false
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02", "Jan 2, 2006", "January 2, 2006"} {
+		if parsed, err := time.Parse(layout, text); err == nil {
+			return parsed, true
+		}
+	}
+	return time.Time{}, false
 }
 
 func normalizedAvailability(value any) string {

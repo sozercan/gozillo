@@ -839,7 +839,7 @@ func normalizeProperty(raw map[string]any, identity propertyIdentity) (Property,
 		ID:          identity.zpid,
 		URL:         normalizeZillowURL(firstString(raw, "url", "hdpUrl", "detailUrl")),
 		Address:     normalizeAddress(raw),
-		Price:       moneyPointer(raw, "unformattedPrice", "price"),
+		Price:       moneyPointer(raw, "unformattedPrice", "baseRent", "minBaseRent", "minPrice", "price"),
 		Bedrooms:    floatPointer(raw, "bedrooms", "beds"),
 		Bathrooms:   floatPointer(raw, "bathrooms", "baths"),
 		LivingArea:  int64Pointer(raw, "livingArea", "area"),
@@ -860,6 +860,14 @@ func normalizeProperty(raw map[string]any, identity propertyIdentity) (Property,
 	if property.ID == "" && property.URL == "" {
 		return Property{}, errors.New("normalized property has no core identity")
 	}
+	property.RequiredMonthlyFees = moneyPointer(raw, "totalRequiredMonthlyMinFee")
+	property.PriceIncludesRequiredFees = boolPointer(raw, "listPriceIncludesRequiredMonthlyFees")
+	property.TotalMonthlyCost = totalMonthlyCost(property.Price, property.RequiredMonthlyFees, property.PriceIncludesRequiredFees)
 	populatePropertyRentalFacts(&property, raw)
+	property.SharedHousing, property.StudentHousing = detectSharedAndStudentHousing(raw, property.Description, property.Address.Full)
+	property.IncomeRestricted = detectIncomeRestrictedHousing(raw, property.Description)
+	if containsExact(property.FlexSpaces, ParkingPrivateGarage) {
+		property.VerificationNotes = append(property.VerificationNotes, "Private garage must be verified as exclusive-use, non-shared, and included in rent.")
+	}
 	return property, nil
 }

@@ -20,8 +20,12 @@ reuse cookies from a fresh browser HAR capture.
 ## Features
 
 - Search one or many cities and ZIP codes.
-- Filter by price, beds, baths, square footage, availability, and freshness.
-- Verify laundry, parking, pets, and flex-space details from property pages.
+- Run bounded server-side bedroom, home-type, Newest, and Recently Changed routes.
+- Paginate each route with conservative request delays and per-location caps.
+- Expand Zillow apartment-community pages into available units or floor plans.
+- Filter by base rent, known total monthly cost, beds, baths, availability, and freshness.
+- Verify laundry, parking, pets, status, fees, and flex-space details from Zillow pages.
+- Compare with a previous JSON/JSONL run to label new, changed, and still-active listings.
 - Sort locally by newest, price, beds, or square footage.
 - Reuse a browser session from a fresh HAR capture.
 - Use HTTP, HTTPS, SOCKS5, or SOCKS5H proxies.
@@ -155,6 +159,64 @@ gozillo search \
 For session-sensitive searches, put the full location set in one command so all
 requests share the same in-memory cookie jar.
 
+### Deep Zillow discovery
+
+Location mode can bootstrap Zillow's rendered page and then use bounded
+server-side result routes. This avoids treating the first Recommended page as
+complete inventory:
+
+```bash
+PREVIOUS='./previous-results.jsonl'
+TARGET_END='YYYY-MM-DD'
+
+gozillo --output=jsonl search \
+  --location 'First City ST' \
+  --location 'Second City ST' \
+  --rent \
+  --session default \
+  --tls-profile "$TLS_PROFILE" \
+  --user-agent "$CAPTURED_UA" \
+  --bed-range 2 \
+  --bed-range 3+ \
+  --server-sort days:3 \
+  --server-sort mostrecentchange:1 \
+  --supplemental-no-laundry \
+  --supplemental-pages 1 \
+  --keyword-route den \
+  --keyword-route office \
+  --keyword-route 'private garage' \
+  --max-pages 3 \
+  --page-delay 5s \
+  --home-type apartment,condo,townhouse,single-family \
+  --strict-location-boundary \
+  --allowed-city 'First City,Second City' \
+  --max-price 3500 \
+  --max-total-cost 3500 \
+  --min-baths 2 \
+  --available-by "$TARGET_END" \
+  --unknown-availability watchlist \
+  --out-of-window-availability watchlist \
+  --verify-rental-status \
+  --verify-recency \
+  --exclude-shared-housing \
+  --exclude-student-housing \
+  --exclude-income-restricted \
+  --laundry in-unit \
+  --unknown-laundry watchlist \
+  --previous-results "$PREVIOUS" \
+  --sort-by newest
+```
+
+A server sort may include its own page cap, such as `days:3`. Use
+`--location-max-pages 'Priority City ST=3'` to give selected locations more
+depth while keeping one process and cookie jar. Discovery merges Zillow list
+and map results. Supplemental no-laundry routes cover listings whose in-unit
+laundry was not indexed, while exact-two-bedroom keyword routes improve flex
+recall. Shared-room, co-living, dorm-style, student-housing, and structured
+income-restriction signals can be excluded after Zillow detail expansion. Strict boundary and allowed-city checks remove cross-boundary results.
+Community results are expanded from Zillow's structured unit and floor-plan
+data; floor-plan-only or otherwise uncertain results remain watchlist items.
+
 ### Filters and property details
 
 ```bash
@@ -164,18 +226,25 @@ gozillo --output=jsonl search \
   --session default \
   --tls-profile "$TLS_PROFILE" \
   --max-price 3500 \
+  --max-total-cost 3500 \
   --min-beds 2 \
   --min-baths 1 \
   --min-sqft 800 \
+  --verify-rental-status \
+  --verify-recency \
+  --exclude-shared-housing \
+  --exclude-student-housing \
+  --exclude-income-restricted \
   --laundry in-unit \
-  --unknown-laundry exclude \
+  --unknown-laundry watchlist \
   --flex den,office,bonus,loft,private-garage \
   --sort-by newest
 ```
 
-Laundry, parking, pet, and flex filters automatically fetch property details.
-Use `--detail-delay` and `--location-delay` to reduce request frequency for
-larger searches.
+Laundry, total-cost, rental-status, parking, pet, and flex filters automatically
+fetch Zillow detail pages. Apartment-community pages can produce multiple unit
+or floor-plan results. Use `--page-delay`, `--detail-delay`, and
+`--location-delay` to reduce request frequency for larger searches.
 
 ### Proxy
 
@@ -234,6 +303,14 @@ error:
 {"location":"Another City ST","error":"..."}
 ```
 
+When available, listings also include `requiredMonthlyFees`,
+`totalMonthlyCost`, verification notes, `historyStatus`, and meaningful
+`historyChanges`. Community-expanded units may not expose `daysOnZillow`. `--verify-recency`
+performs a second, non-destructive unit-page pass. When an individual unit page
+exposes the current rental cycle in `priceHistory`, gozillo derives
+listed/updated dates and exact calendar days; otherwise CSV exports label the
+value `Unknown`, explain the evidence gap, and record the last-checked date.
+
 ## Commands
 
 | Command | Purpose |
@@ -277,8 +354,11 @@ many separate commands.
 
 ### Missing listings
 
-Location mode reads one rendered page per city or ZIP. It does not currently
-paginate or run every server-side property-type or bedroom route.
+The default location search remains one rendered page. For deeper coverage,
+use bounded `--bed-range`, `--server-sort`, `--max-pages`, and `--home-type`
+routes. `--supplemental-no-laundry` covers amenity-index misses, and
+`--keyword-route` adds focused flex searches. Review stderr coverage warnings
+when a route has more reported pages than the configured cap. Zillow can still omit or change private website data.
 
 ## Development
 

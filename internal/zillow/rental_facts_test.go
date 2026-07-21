@@ -168,3 +168,20 @@ func TestReadPropertyNormalizesStructuredRentalFacts(t *testing.T) {
 		t.Fatalf("FlexSpaces = %#v", property.FlexSpaces)
 	}
 }
+
+func TestRentalHistoryRecencyUsesLatestCurrentRentalListing(t *testing.T) {
+	t.Parallel()
+
+	raw := map[string]any{
+		"priceHistory": []any{
+			map[string]any{"date": "2026-07-18", "event": "Price change", "postingIsRental": true},
+			map[string]any{"date": "2026-07-10", "event": "Listed for rent", "postingIsRental": true},
+			map[string]any{"date": "2025-04-01", "event": "Listing removed", "postingIsRental": true},
+			map[string]any{"date": "2025-03-01", "event": "Listed for rent", "postingIsRental": true},
+		},
+	}
+	listed, updated, days := rentalHistoryRecency(raw, time.Date(2026, time.July, 21, 0, 0, 0, 0, time.UTC))
+	if listed != "2026-07-10" || updated != "2026-07-18" || days == nil || *days != 11 {
+		t.Fatalf("recency = (%q, %q, %v)", listed, updated, days)
+	}
+}

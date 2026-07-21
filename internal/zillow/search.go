@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 )
@@ -110,31 +111,70 @@ func decodeSearchResponse(data []byte, requestID uint64, queryState map[string]a
 		return nil, &SchemaDriftError{Operation: "search", Path: "listResults", Detail: "required listing array is missing"}
 	}
 
+	groups := []struct {
+		items []any
+		path  string
+	}{{items: items, path: path}}
+	if mapItems, mapPath, exists, valid := findOptionalResultArray(object, "mapResults"); exists {
+		if !valid {
+			return nil, &SchemaDriftError{Operation: "search", Path: mapPath, Detail: "map results must be an array"}
+		}
+		groups = append(groups, struct {
+			items []any
+			path  string
+		}{items: mapItems, path: mapPath})
+	}
+
 	listings := make([]Listing, 0, len(items))
-	for index, item := range items {
-		listingObject, ok := item.(map[string]any)
-		if !ok {
-			return nil, &SchemaDriftError{
-				Operation: "search",
-				Path:      fmt.Sprintf("%s[%d]", path, index),
-				Detail:    "listing must be an object",
+	seenListings := make(map[string]struct{})
+	for _, group := range groups {
+		for index, item := range group.items {
+			listingObject, ok := item.(map[string]any)
+			if !ok {
+				return nil, &SchemaDriftError{
+					Operation: "search",
+					Path:      fmt.Sprintf("%s[%d]", group.path, index),
+					Detail:    "listing must be an object",
+				}
 			}
-		}
-		listing, err := normalizeListing(listingObject)
-		if err != nil {
-			return nil, &SchemaDriftError{
-				Operation: "search",
-				Path:      fmt.Sprintf("%s[%d]", path, index),
-				Detail:    err.Error(),
+			listing, err := normalizeListing(listingObject)
+			if err != nil {
+				return nil, &SchemaDriftError{
+					Operation: "search",
+					Path:      fmt.Sprintf("%s[%d]", group.path, index),
+					Detail:    err.Error(),
+				}
 			}
+			if strings.HasSuffix(group.path, ".mapResults") && listing.URL == "" {
+				listing.URL = communityPropertyURL(listing.ID, "")
+			}
+			key := listingDiscoveryKey(listing)
+			if key != "" {
+				if _, exists := seenListings[key]; exists {
+					continue
+				}
+				seenListings[key] = struct{}{}
+			}
+			listings = append(listings, listing)
 		}
-		listings = append(listings, listing)
 	}
 
 	metadata := SearchMetadata{
 		RequestID:   requestID,
 		CurrentPage: searchPage(queryState),
 		Returned:    len(listings),
+	}
+	if value, ok := firstPathValue(object,
+		[]string{"cat1", "searchList", "resultsPerPage"},
+		[]string{"searchPageState", "cat1", "searchList", "resultsPerPage"},
+	); ok {
+		metadata.ResultsPerPage, _ = intFromAny(value)
+	}
+	if value, ok := firstPathValue(object,
+		[]string{"cat1", "searchList", "totalPages"},
+		[]string{"searchPageState", "cat1", "searchList", "totalPages"},
+	); ok {
+		metadata.TotalPages, _ = intFromAny(value)
 	}
 	if value, ok := firstPathValue(object,
 		[]string{"cat1", "searchList", "totalResultCount"},
@@ -160,6 +200,24 @@ func decodeSearchResponse(data []byte, requestID uint64, queryState map[string]a
 	}
 
 	return &SearchResult{Listings: listings, Metadata: metadata}, nil
+}
+
+func findOptionalResultArray(root map[string]any, name string) ([]any, string, bool, bool) {
+	paths := [][]string{
+		{"cat1", "searchResults", name},
+		{"searchPageState", "cat1", "searchResults", name},
+		{"data", "cat1", "searchResults", name},
+	}
+	for _, path := range paths {
+		if value, ok := lookupPath(root, path...); ok {
+			if value == nil {
+				return nil, strings.Join(path, "."), true, true
+			}
+			items, valid := value.([]any)
+			return items, strings.Join(path, "."), true, valid
+		}
+	}
+	return nil, "", false, true
 }
 
 func findListResults(root map[string]any) ([]any, string, bool) {
@@ -201,13 +259,34 @@ func normalizeListing(raw map[string]any) (Listing, error) {
 		ImageURL:  firstString(raw, "imgSrc", "imageUrl"),
 		PriceText: stringValue(raw["price"]),
 	}
+	listing.IsBuilding, _ = boolFromAny(raw["isBuilding"])
+	if listing.IsBuilding && listing.HomeType == "" {
+		listing.HomeType = "APARTMENT"
+	}
 	listing.Address = normalizeAddress(raw)
+	listing.Description = firstString(raw, "description")
+	listing.SharedHousing, listing.StudentHousing = detectSharedAndStudentHousing(raw, listing.Description, listing.Address.Full)
+	listing.IncomeRestricted = detectIncomeRestrictedHousing(raw, listing.Description)
 	listing.Bedrooms = floatPointer(raw, "beds", "bedrooms")
 	listing.Bathrooms = floatPointer(raw, "baths", "bathrooms")
 	listing.LivingArea = int64Pointer(raw, "area", "livingArea")
-	listing.Price = moneyPointer(raw, "unformattedPrice", "price")
+	listing.Price = moneyPointer(raw, "unformattedPrice", "baseRent", "minBaseRent", "minPrice", "price")
+	listing.RequiredMonthlyFees = moneyPointer(raw, "totalRequiredMonthlyMinFee")
+	listing.PriceIncludesRequiredFees = boolPointer(raw, "listPriceIncludesRequiredMonthlyFees")
+	listing.TotalMonthlyCost = totalMonthlyCost(listing.Price, listing.RequiredMonthlyFees, listing.PriceIncludesRequiredFees)
+	if listing.IsBuilding {
+		if maximum := maximumUnitBedrooms(raw["units"]); maximum != nil {
+			listing.Bedrooms = maximum
+		}
+	}
 	listing.Coordinates = normalizeCoordinates(raw)
 	listing.DaysOnZillow = int64Pointer(raw, "daysOnZillow")
+	listedDate, updatedDate, derivedDays := rentalHistoryRecency(raw, time.Now().UTC())
+	listing.ListedDate = listedDate
+	listing.UpdatedDate = updatedDate
+	if listing.DaysOnZillow == nil {
+		listing.DaysOnZillow = derivedDays
+	}
 	if homeInfo, ok := lookupPath(raw, "hdpData", "homeInfo"); ok {
 		if home, ok := homeInfo.(map[string]any); ok && listing.DaysOnZillow == nil {
 			listing.DaysOnZillow = int64Pointer(home, "daysOnZillow")
@@ -218,6 +297,29 @@ func normalizeListing(raw map[string]any) (Listing, error) {
 		return Listing{}, errors.New("listing has no recognized core identity")
 	}
 	return listing, nil
+}
+
+func maximumUnitBedrooms(value any) *float64 {
+	units, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+	var maximum *float64
+	for _, rawUnit := range units {
+		unit, ok := rawUnit.(map[string]any)
+		if !ok {
+			continue
+		}
+		beds, ok := floatFromAny(unit["beds"])
+		if !ok {
+			continue
+		}
+		if maximum == nil || beds > *maximum {
+			copy := beds
+			maximum = &copy
+		}
+	}
+	return maximum
 }
 
 func validateListingFields(raw map[string]any) error {
@@ -558,7 +660,7 @@ func int64Pointer(raw map[string]any, keys ...string) *int64 {
 
 func moneyPointer(raw map[string]any, keys ...string) *int64 {
 	for _, key := range keys {
-		if value, ok := int64FromAny(raw[key]); ok {
+		if value, ok := int64FromAny(raw[key]); ok && value >= 0 {
 			copy := value
 			return &copy
 		}

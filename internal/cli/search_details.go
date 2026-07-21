@@ -15,33 +15,43 @@ const (
 	filterAny             = "any"
 	unknownLaundryExclude = "exclude"
 	unknownLaundryWatch   = "watchlist"
+	availabilityExclude   = "exclude"
+	availabilityWatchlist = "watchlist"
 )
 
 type detailFilterOptions struct {
-	Enrich          bool
-	Workers         int
-	Delay           time.Duration
-	MinSqft         int64
-	MaxDaysOnZillow int64
-	AvailableFrom   *time.Time
-	AvailableBy     *time.Time
-	Laundry         string
-	Parking         string
-	Pets            string
-	Flex            []string
-	UnknownLaundry  string
+	Enrich                  bool
+	VerifyRecency           bool
+	Workers                 int
+	Delay                   time.Duration
+	MinSqft                 int64
+	MaxDaysOnZillow         int64
+	AvailableFrom           *time.Time
+	AvailableBy             *time.Time
+	UnknownAvailability     string
+	OutOfWindowAvailability string
+	MaxTotalCost            int64
+	RequireForRent          bool
+	ExcludeSharedHousing    bool
+	ExcludeStudentHousing   bool
+	ExcludeIncomeRestricted bool
+	Laundry                 string
+	Parking                 string
+	Pets                    string
+	Flex                    []string
+	UnknownLaundry          string
 }
 
 func (options detailFilterOptions) needsEnrichment() bool {
-	return options.Enrich || options.requiresAmenityDetails()
+	return options.Enrich || options.VerifyRecency || options.requiresAmenityDetails()
 }
 
 func (options detailFilterOptions) requiresAmenityDetails() bool {
-	return options.Laundry != filterAny || options.Parking != filterAny || options.Pets != filterAny || len(options.Flex) > 0
+	return options.Laundry != filterAny || options.Parking != filterAny || options.Pets != filterAny || len(options.Flex) > 0 || options.RequireForRent || options.ExcludeSharedHousing || options.ExcludeStudentHousing || options.ExcludeIncomeRestricted
 }
 
 func (options detailFilterOptions) hasAdvancedFilters() bool {
-	return options.MinSqft > 0 || options.MaxDaysOnZillow >= 0 || options.AvailableFrom != nil || options.AvailableBy != nil ||
+	return options.MinSqft > 0 || options.MaxDaysOnZillow >= 0 || options.AvailableFrom != nil || options.AvailableBy != nil || options.MaxTotalCost > 0 || options.RequireForRent || options.ExcludeSharedHousing || options.ExcludeStudentHousing || options.ExcludeIncomeRestricted ||
 		options.Laundry != filterAny || options.Parking != filterAny || options.Pets != filterAny || len(options.Flex) > 0
 }
 
@@ -60,6 +70,15 @@ func validateDetailFilterOptions(options detailFilterOptions) error {
 	}
 	if options.AvailableFrom != nil && options.AvailableBy != nil && options.AvailableFrom.After(*options.AvailableBy) {
 		return errors.New("available-from must not be after available-by")
+	}
+	if options.MaxTotalCost < 0 {
+		return errors.New("max-total-cost must not be negative")
+	}
+	if !oneOf(options.UnknownAvailability, "", availabilityExclude, availabilityWatchlist) {
+		return fmt.Errorf("unknown-availability value %q is invalid (want exclude or watchlist)", options.UnknownAvailability)
+	}
+	if !oneOf(options.OutOfWindowAvailability, "", availabilityExclude, availabilityWatchlist) {
+		return fmt.Errorf("out-of-window-availability value %q is invalid (want exclude or watchlist)", options.OutOfWindowAvailability)
 	}
 	if !oneOf(options.Laundry, filterAny, zillow.LaundryInUnit, zillow.LaundryHookups, zillow.LaundryShared, zillow.LaundryNone, zillow.LaundryUnknown) {
 		return fmt.Errorf("unknown laundry value %q (want any, in-unit, hookups, shared, none, or unknown)", options.Laundry)
@@ -129,18 +148,19 @@ func oneOf(value string, choices ...string) bool {
 }
 
 type detailFetchResult struct {
-	property *zillow.Property
-	err      error
+	page *zillow.RentalPage
+	err  error
 }
 
 type propertyDiskRecord struct {
-	Property   *zillow.Property `json:"property,omitempty"`
-	Error      string           `json:"error,omitempty"`
-	RetryAfter time.Time        `json:"retryAfter,omitempty"`
+	Page       *zillow.RentalPage `json:"page,omitempty"`
+	Property   *zillow.Property   `json:"property,omitempty"` // legacy cache compatibility
+	Error      string             `json:"error,omitempty"`
+	RetryAfter time.Time          `json:"retryAfter,omitempty"`
 }
 
 type propertyFetcher interface {
-	FetchProperty(context.Context, string) (*zillow.Property, error)
+	FetchRentalPage(context.Context, string) (*zillow.RentalPage, error)
 }
 
 type listingDetailEnricher struct {
@@ -164,9 +184,9 @@ func newListingDetailEnricher(client propertyFetcher, workers int, delay time.Du
 	}
 }
 
-func (enricher *listingDetailEnricher) Enrich(ctx context.Context, listings []zillow.Listing) {
+func (enricher *listingDetailEnricher) Enrich(ctx context.Context, listings []zillow.Listing) []zillow.Listing {
 	if enricher == nil || enricher.client == nil || len(listings) == 0 {
-		return
+		return listings
 	}
 
 	uniqueURLs := make([]string, 0, len(listings))
@@ -208,8 +228,8 @@ func (enricher *listingDetailEnricher) Enrich(ctx context.Context, listings []zi
 					enricher.store(url, detailFetchResult{err: err})
 					continue
 				}
-				property, err := enricher.client.FetchProperty(ctx, url)
-				result := detailFetchResult{property: property, err: err}
+				page, err := enricher.client.FetchRentalPage(ctx, url)
+				result := detailFetchResult{page: page, err: err}
 				enricher.savePersistent(url, result)
 				enricher.store(url, result)
 			}
@@ -221,27 +241,46 @@ func (enricher *listingDetailEnricher) Enrich(ctx context.Context, listings []zi
 	close(jobs)
 	workers.Wait()
 
+	expanded := make([]zillow.Listing, 0, len(listings))
 	for index := range listings {
 		url := strings.TrimSpace(listings[index].URL)
 		if url == "" {
 			markDetailsUnavailable(&listings[index], "listing has no property URL")
+			expanded = append(expanded, listings[index])
 			continue
 		}
 		result, ok := enricher.cached(url)
 		if !ok {
 			markDetailsUnavailable(&listings[index], "property details were not fetched")
+			expanded = append(expanded, listings[index])
 			continue
 		}
 		if result.err != nil {
 			markDetailsUnavailable(&listings[index], result.err.Error())
+			expanded = append(expanded, listings[index])
 			continue
 		}
-		if result.property == nil {
-			markDetailsUnavailable(&listings[index], "property fetch returned no details")
+		if result.page == nil || len(result.page.Properties) == 0 {
+			markDetailsUnavailable(&listings[index], "rental page returned no details")
+			expanded = append(expanded, listings[index])
 			continue
 		}
-		mergePropertyDetails(&listings[index], result.property)
+		for propertyIndex := range result.page.Properties {
+			if propertyIndex == 0 {
+				if result.page.Kind == zillow.RentalPageCommunity {
+					mergeCommunityPropertyDetails(&listings[index], &result.page.Properties[propertyIndex])
+				} else {
+					mergePropertyDetails(&listings[index], &result.page.Properties[propertyIndex])
+				}
+				expanded = append(expanded, listings[index])
+				continue
+			}
+			candidate := listings[index]
+			mergeCommunityPropertyDetails(&candidate, &result.page.Properties[propertyIndex])
+			expanded = append(expanded, candidate)
+		}
 	}
+	return expanded
 }
 
 func (enricher *listingDetailEnricher) loadPersistent(url string) (detailFetchResult, bool) {
@@ -253,8 +292,11 @@ func (enricher *listingDetailEnricher) loadPersistent(url string) (detailFetchRe
 	if err != nil || !hit {
 		return detailFetchResult{}, false
 	}
+	if record.Page != nil {
+		return detailFetchResult{page: record.Page}, true
+	}
 	if record.Property != nil {
-		return detailFetchResult{property: record.Property}, true
+		return detailFetchResult{page: &zillow.RentalPage{Kind: zillow.RentalPageProperty, Properties: []zillow.Property{*record.Property}}}, true
 	}
 	if record.Error != "" && record.RetryAfter.After(enricher.diskCache.now()) {
 		return detailFetchResult{err: errors.New(record.Error)}, true
@@ -266,7 +308,7 @@ func (enricher *listingDetailEnricher) savePersistent(url string, result detailF
 	if enricher == nil || enricher.diskCache == nil {
 		return
 	}
-	record := propertyDiskRecord{Property: result.property}
+	record := propertyDiskRecord{Page: result.page}
 	if result.err != nil {
 		switch {
 		case errors.Is(result.err, zillow.ErrSchemaDrift):
@@ -336,17 +378,83 @@ func mergePropertyDetails(listing *zillow.Listing, property *zillow.Property) {
 	listing.PetPolicy = property.PetPolicy
 	listing.AllowedPets = append([]string(nil), property.AllowedPets...)
 	listing.FlexSpaces = append([]string(nil), property.FlexSpaces...)
-	if listing.LivingArea == nil {
+	listing.RequiredMonthlyFees = property.RequiredMonthlyFees
+	listing.TotalMonthlyCost = property.TotalMonthlyCost
+	listing.PriceIncludesRequiredFees = property.PriceIncludesRequiredFees
+	listing.VerificationNotes = append([]string(nil), property.VerificationNotes...)
+	listing.SharedHousing = property.SharedHousing
+	listing.StudentHousing = property.StudentHousing
+	listing.IncomeRestricted = property.IncomeRestricted
+	if property.Price != nil {
+		listing.Price = property.Price
+	}
+	if property.Bedrooms != nil {
+		listing.Bedrooms = property.Bedrooms
+	}
+	if property.Bathrooms != nil {
+		listing.Bathrooms = property.Bathrooms
+	}
+	if property.LivingArea != nil {
 		listing.LivingArea = property.LivingArea
 	}
-	if listing.DaysOnZillow == nil {
+	if property.DaysOnZillow != nil {
 		listing.DaysOnZillow = property.DaysOnZillow
 	}
-	if strings.TrimSpace(listing.Availability) == "" {
+	if property.ListedDate != "" {
+		listing.ListedDate = property.ListedDate
+	}
+	if property.UpdatedDate != "" {
+		listing.UpdatedDate = property.UpdatedDate
+	}
+	if strings.TrimSpace(property.Availability) != "" {
 		listing.Availability = property.Availability
 	}
-	if listing.HomeType == "" {
+	if property.HomeType != "" {
 		listing.HomeType = property.HomeType
+	}
+	if property.Status != "" {
+		listing.Status = property.Status
+	}
+}
+
+func mergeCommunityPropertyDetails(listing *zillow.Listing, property *zillow.Property) {
+	if listing == nil || property == nil {
+		return
+	}
+	originalDays := listing.DaysOnZillow
+	mergePropertyDetails(listing, property)
+	if property.ID != "" {
+		listing.ID = property.ID
+	}
+	if property.URL != "" {
+		listing.URL = property.URL
+	}
+	if property.Address.Full != "" {
+		listing.Address = property.Address
+	}
+	if property.Price != nil {
+		listing.Price = property.Price
+	}
+	if property.Bedrooms != nil {
+		listing.Bedrooms = property.Bedrooms
+	}
+	if property.Bathrooms != nil {
+		listing.Bathrooms = property.Bathrooms
+	}
+	if property.LivingArea != nil {
+		listing.LivingArea = property.LivingArea
+	}
+	if property.Status != "" {
+		listing.Status = property.Status
+	}
+	if property.HomeType != "" {
+		listing.HomeType = property.HomeType
+	}
+	if property.Availability != "" {
+		listing.Availability = property.Availability
+	}
+	if listing.DaysOnZillow == nil {
+		listing.DaysOnZillow = originalDays
 	}
 }
 
@@ -360,7 +468,7 @@ func prefilterKnownListingMetadata(listings []zillow.Listing, options detailFilt
 			continue
 		}
 		if options.AvailableFrom != nil || options.AvailableBy != nil {
-			if available, ok := listingAvailabilityDate(listing.Availability, today); ok {
+			if available, ok := listingAvailabilityDate(listing.Availability, today); ok && options.OutOfWindowAvailability == availabilityExclude {
 				if options.AvailableFrom != nil && available.Before(*options.AvailableFrom) {
 					continue
 				}
@@ -368,6 +476,21 @@ func prefilterKnownListingMetadata(listings []zillow.Listing, options detailFilt
 					continue
 				}
 			}
+		}
+		if options.MaxTotalCost > 0 && listing.TotalMonthlyCost != nil && *listing.TotalMonthlyCost > options.MaxTotalCost {
+			continue
+		}
+		if options.RequireForRent && strings.TrimSpace(listing.Status) != "" && !isForRentStatus(listing.Status) {
+			continue
+		}
+		if options.ExcludeSharedHousing && listing.SharedHousing {
+			continue
+		}
+		if options.ExcludeStudentHousing && listing.StudentHousing {
+			continue
+		}
+		if options.ExcludeIncomeRestricted && listing.IncomeRestricted {
+			continue
 		}
 		filtered = append(filtered, listing)
 	}
@@ -384,6 +507,15 @@ func filterDetailedListings(listings []zillow.Listing, options detailFilterOptio
 		listing.MatchStatus = zillow.MatchStatusMatch
 		listing.MatchReasons = nil
 
+		if options.ExcludeSharedHousing && listing.SharedHousing {
+			continue
+		}
+		if options.ExcludeStudentHousing && listing.StudentHousing {
+			continue
+		}
+		if options.ExcludeIncomeRestricted && listing.IncomeRestricted {
+			continue
+		}
 		if options.MinSqft > 0 && (listing.LivingArea == nil || *listing.LivingArea < options.MinSqft) {
 			continue
 		}
@@ -393,12 +525,33 @@ func filterDetailedListings(listings []zillow.Listing, options detailFilterOptio
 		if options.AvailableFrom != nil || options.AvailableBy != nil {
 			available, ok := listingAvailabilityDate(listing.Availability, today)
 			if !ok {
+				if options.UnknownAvailability == availabilityWatchlist {
+					markListingWatchlist(&listing, "availability needs verification")
+				} else {
+					continue
+				}
+			} else {
+				outside := options.AvailableFrom != nil && available.Before(*options.AvailableFrom) || options.AvailableBy != nil && available.After(*options.AvailableBy)
+				if outside {
+					if options.OutOfWindowAvailability == availabilityWatchlist {
+						markListingWatchlist(&listing, "availability is outside the target window")
+					} else {
+						continue
+					}
+				}
+			}
+		}
+		if options.MaxTotalCost > 0 {
+			if listing.TotalMonthlyCost == nil {
+				markListingWatchlist(&listing, "total monthly cost needs verification")
+			} else if *listing.TotalMonthlyCost > options.MaxTotalCost {
 				continue
 			}
-			if options.AvailableFrom != nil && available.Before(*options.AvailableFrom) {
-				continue
-			}
-			if options.AvailableBy != nil && available.After(*options.AvailableBy) {
+		}
+		if options.RequireForRent {
+			if strings.TrimSpace(listing.Status) == "" {
+				markListingWatchlist(&listing, "current rental status needs verification")
+			} else if !isForRentStatus(listing.Status) {
 				continue
 			}
 		}
@@ -424,9 +577,48 @@ func filterDetailedListings(listings []zillow.Listing, options detailFilterOptio
 		if len(options.Flex) > 0 && !hasAnyValue(listing.FlexSpaces, options.Flex) {
 			continue
 		}
+		if isTwoBedPrivateGarageOnly(listing) {
+			markListingWatchlist(&listing, "private garage flex requires exclusive-use and inclusion verification")
+		}
 		filtered = append(filtered, listing)
 	}
 	return filtered
+}
+
+func markListingWatchlist(listing *zillow.Listing, reason string) {
+	if listing == nil {
+		return
+	}
+	listing.MatchStatus = zillow.MatchStatusWatchlist
+	for _, existing := range listing.MatchReasons {
+		if existing == reason {
+			return
+		}
+	}
+	listing.MatchReasons = append(listing.MatchReasons, reason)
+}
+
+func isForRentStatus(value string) bool {
+	normalized := strings.ToUpper(strings.TrimSpace(value))
+	return normalized == "FOR_RENT" || normalized == "FOR RENT" || strings.HasPrefix(normalized, "FOR_RENT_")
+}
+
+func isTwoBedPrivateGarageOnly(listing zillow.Listing) bool {
+	if listing.Bedrooms == nil || *listing.Bedrooms != 2 {
+		return false
+	}
+	hasGarage := false
+	for _, value := range listing.FlexSpaces {
+		normalized := normalizeDetailChoice(value)
+		if normalized == zillow.ParkingPrivateGarage {
+			hasGarage = true
+			continue
+		}
+		if oneOf(normalized, "den", "office", "bonus", "loft", "flex") {
+			return false
+		}
+	}
+	return hasGarage
 }
 
 func parkingMatches(filter, value string) bool {
@@ -506,4 +698,81 @@ func listingAvailabilityDate(value string, today time.Time) (time.Time, bool) {
 func dateOnly(value time.Time) time.Time {
 	year, month, day := value.Date()
 	return time.Date(year, month, day, 0, 0, 0, 0, time.UTC)
+}
+
+// EnrichRecency performs a second, non-destructive pass over expanded unit
+// URLs. It fills only recency fields, leaving already-confirmed rental facts
+// intact when a unit page is unavailable or challenged.
+func (enricher *listingDetailEnricher) EnrichRecency(ctx context.Context, listings []zillow.Listing) []zillow.Listing {
+	if enricher == nil || enricher.client == nil || len(listings) == 0 {
+		return listings
+	}
+	seen := make(map[string]struct{})
+	for _, listing := range listings {
+		if listing.DaysOnZillow != nil || strings.TrimSpace(listing.URL) == "" {
+			continue
+		}
+		url := strings.TrimSpace(listing.URL)
+		if _, exists := seen[url]; exists {
+			continue
+		}
+		seen[url] = struct{}{}
+		if _, cached := enricher.cached(url); cached {
+			continue
+		}
+		if result, hit := enricher.loadPersistent(url); hit {
+			enricher.store(url, result)
+			continue
+		}
+		if err := enricher.waitForTurn(ctx); err != nil {
+			enricher.store(url, detailFetchResult{err: err})
+			continue
+		}
+		page, err := enricher.client.FetchRentalPage(ctx, url)
+		result := detailFetchResult{page: page, err: err}
+		enricher.savePersistent(url, result)
+		enricher.store(url, result)
+	}
+
+	for index := range listings {
+		if listings[index].DaysOnZillow != nil {
+			continue
+		}
+		result, ok := enricher.cached(strings.TrimSpace(listings[index].URL))
+		if !ok || result.err != nil || result.page == nil {
+			continue
+		}
+		property := rentalPagePropertyForListing(result.page, listings[index])
+		if property == nil {
+			continue
+		}
+		if property.DaysOnZillow != nil {
+			listings[index].DaysOnZillow = property.DaysOnZillow
+		}
+		if property.ListedDate != "" {
+			listings[index].ListedDate = property.ListedDate
+		}
+		if property.UpdatedDate != "" {
+			listings[index].UpdatedDate = property.UpdatedDate
+		}
+	}
+	return listings
+}
+
+func rentalPagePropertyForListing(page *zillow.RentalPage, listing zillow.Listing) *zillow.Property {
+	if page == nil {
+		return nil
+	}
+	for index := range page.Properties {
+		if listing.ID != "" && page.Properties[index].ID == listing.ID {
+			return &page.Properties[index]
+		}
+		if listing.URL != "" && page.Properties[index].URL == listing.URL {
+			return &page.Properties[index]
+		}
+	}
+	if len(page.Properties) == 1 {
+		return &page.Properties[0]
+	}
+	return nil
 }

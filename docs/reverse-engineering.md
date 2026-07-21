@@ -6,13 +6,24 @@ particular search, address, account, or captured browser identity.
 
 ## Result-page transport
 
-Location mode fetches Zillow search-results-page HTML and extracts:
+The default location mode fetches Zillow search-results-page HTML and extracts:
 
 ```text
 script#__NEXT_DATA__
 └── props.pageProps.searchPageState
+    ├── queryState
     └── cat1.searchResults.listResults
 ```
+
+Bounded discovery mode uses that rendered page as a bootstrap. It converts the
+captured `queryState` into an in-memory search profile, then performs paginated
+`PUT /async-create-search-page-state` requests for configured bedroom, sort,
+and keyword routes. Each request asks for both `listResults` and `mapResults`,
+which are normalized and deduplicated before cross-page/route deduplication.
+Results are deduplicated across pages and routes while route-level
+coverage records whether the configured page cap reached Zillow's reported end.
+A failure on one later route page is retained as a partial-coverage issue rather
+than discarding earlier successful pages.
 
 Routes are constructed from a normalized location:
 
@@ -183,10 +194,22 @@ For a session-sensitive or large workflow:
 This structure preserves cookie evolution and avoids repeating the same search
 page for separate bedroom, price, or amenity views.
 
-Location mode currently reads one rendered result page per city or ZIP. It does
-not paginate and does not invoke separate server-side property-type, bedroom,
-or newest-result routes. A successful request should therefore not be treated
-as exhaustive inventory.
+Location mode defaults to one rendered result page for compatibility. Bounded
+discovery is enabled by server-route flags such as `--bed-range`,
+`--server-sort`, `--home-type`, and `--max-pages`. Supplemental routes can omit
+Zillow's indexed laundry flag before local detail confirmation, and exact-two
+keyword routes cover flex terms that may not appear in normalized room data.
+Sort values can carry a
+per-route cap (`days:3`), while `--location-max-pages` can reduce or increase
+depth for selected locations within the same process. Search totals across
+overlapping city and ZIP routes are not additive or unique, and a configured
+page cap can still leave reported pages unread; coverage warnings make that
+limitation explicit.
+
+Optional strict boundary validation requires exact postal codes for ZIP routes
+and exact city names for city routes. Query aliases support neighborhoods whose
+postal city differs from the Zillow route name, while an allowed-city set removes
+cross-boundary ZIP results after detail expansion.
 
 ## Internal direct-search request
 
@@ -220,9 +243,23 @@ Property pages normally include a `__NEXT_DATA__` JSON script. Within
 individual property object. The property command selects the authoritative
 property identity and normalizes that object from local HTML or a live URL.
 
-Some active pages are community, building, or alternate landing pages and do
-not expose the expected individual-property cache. Those responses are treated
-as schema-unavailable rather than fabricated detail success.
+Individual pages are parsed from the authoritative property object when it is
+available. Apartment-community pages use a separate structured path under
+`componentProps.initialReduxState.gdp.building`. Floor plans and units are
+expanded into normalized rental properties with unit/floor-plan beds, baths,
+base rent, required monthly fees, availability, laundry, parking, pets, and
+Zillow URLs. A floor plan without an exact available unit is retained with a
+verification note instead of being presented as fully confirmed. Community and
+unit payloads frequently omit `daysOnZillow`. Optional recency verification
+performs a second pass over expanded unit URLs without discarding already
+confirmed facts when that pass fails. Individual unit pages can expose a
+current rental cycle in `priceHistory`; the normalizer uses the most recent
+post-removal “Listed for rent” event and subsequent rental updates to derive
+listed/updated dates and exact calendar days. When neither source exists,
+exporters preserve an explicit `Unknown` value with evidence and last-checked
+fields rather than deriving age from availability or page-render timestamps. Other
+alternate landing pages without either supported structure remain
+schema-unavailable.
 
 ## Structured rental facts
 
@@ -230,15 +267,32 @@ When an individual property object exposes `resoFacts`, the normalizer
 conservatively derives:
 
 - laundry features and in-unit/hookup/shared/none/unknown status;
+- base rent, known required monthly fees, and known total monthly cost;
 - parking and private-garage signals;
 - pet policy and allowed-pet text;
-- availability, days on site, and year built;
-- den, office, bonus room, loft/flex, and private-garage candidates.
+- availability, days on site, rental status, and year built;
+- den, office, bonus room, loft/flex, and private-garage candidates;
+- verification notes for floor-plan-only results, unknown fees, and garages
+  whose exclusive use must be confirmed;
+- structured and text-derived shared-room, co-living, dorm, individual-lease,
+  per-bed, and student-housing signals for explicit exclusion;
+- income-restricted, low-income, income-limit, and structured household
+  eligibility signals for explicit exclusion.
 
 Generic living rooms, dining areas, balconies, shared parking, and generic
 leasing-office text are not promoted to private flex spaces. When a property
 page is challenged or lacks the required property object, the listing is marked
 unavailable and unknown facts do not satisfy strict filters.
+
+## Local result history
+
+`--previous-results` accepts prior JSON or JSONL emitted by `gozillo`, including
+multi-location wrapper records. Current listings are matched by Zillow ID, then
+URL, then normalized address and labeled as new, previously changed, or still
+active. Meaningful changes include price, known total cost, required fees,
+availability, bedroom/bathroom count, laundry confirmation, flex details, and
+rental status. This comparison is local and never reads Gmail or another
+service.
 
 ## Capture boundary
 

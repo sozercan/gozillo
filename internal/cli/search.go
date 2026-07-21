@@ -53,6 +53,11 @@ func (searchCommand) Run(ctx Context, args []string) error {
 	snapshotPath := flags.String("snapshot", "", "saved Zillow HTML or raw __NEXT_DATA__ JSON")
 	var locationValues stringListFlag
 	flags.Var(&locationValues, "location", "location/ZIP; repeat or separate multiple values with commas")
+	strictLocationBoundary := flags.Bool("strict-location-boundary", false, "require exact ZIP or city matches for location results")
+	var allowedCityValues stringListFlag
+	flags.Var(&allowedCityValues, "allowed-city", "allowed result city; repeat or use commas")
+	var locationCityAliasValues stringListFlag
+	flags.Var(&locationCityAliasValues, "location-city-alias", "query city alias as QUERY=CITY; repeat as needed")
 	forRent := flags.Bool("rent", false, "search rentals instead of for-sale listings")
 	proxyValue := flags.String("proxy", "", "HTTP/HTTPS/SOCKS5 proxy URL; otherwise use standard proxy environment variables")
 	sessionName := flags.String("session", "", "named browser-derived session imported from a raw HAR")
@@ -64,11 +69,19 @@ func (searchCommand) Run(ctx Context, args []string) error {
 	minPrice := flags.Int64("min-price", 0, "minimum price")
 	maxPrice := flags.Int64("max-price", 0, "maximum price")
 	minBeds := flags.Float64("min-beds", 0, "minimum bedrooms")
+	maxBeds := flags.Float64("max-beds", 0, "maximum bedrooms")
 	minBaths := flags.Float64("min-baths", 0, "minimum bathrooms")
 	minSqft := flags.Int64("min-sqft", 0, "minimum living area in square feet")
 	maxDaysOnZillow := flags.Int64("max-days-on-zillow", -1, "maximum days on Zillow; -1 disables the filter")
 	availableFromValue := flags.String("available-from", "", "earliest availability date (YYYY-MM-DD)")
 	availableByValue := flags.String("available-by", "", "latest availability date (YYYY-MM-DD)")
+	unknownAvailabilityValue := flags.String("unknown-availability", availabilityExclude, "handling for unknown availability: exclude or watchlist")
+	outOfWindowAvailabilityValue := flags.String("out-of-window-availability", availabilityExclude, "handling for dates outside the target window: exclude or watchlist")
+	maxTotalCost := flags.Int64("max-total-cost", 0, "maximum known monthly cost including required fees")
+	verifyRentalStatus := flags.Bool("verify-rental-status", false, "require property-page rental status confirmation")
+	excludeSharedHousing := flags.Bool("exclude-shared-housing", false, "exclude room-by-room, co-living, and shared-housing listings")
+	excludeStudentHousing := flags.Bool("exclude-student-housing", false, "exclude student housing and dorm-style listings")
+	excludeIncomeRestricted := flags.Bool("exclude-income-restricted", false, "exclude listings with household income eligibility limits")
 	laundryValue := flags.String("laundry", filterAny, "laundry: any, in-unit, hookups, shared, none, or unknown")
 	parkingValue := flags.String("parking", filterAny, "parking: any, available, garage, private-garage, none, or unknown")
 	petsValue := flags.String("pets", filterAny, "pets: any, allowed, dogs, cats, none, or unknown")
@@ -76,19 +89,35 @@ func (searchCommand) Run(ctx Context, args []string) error {
 	flags.Var(&flexValues, "flex", "required flex type; repeat or use commas: den, office, bonus, loft, flex, private-garage")
 	unknownLaundryValue := flags.String("unknown-laundry", unknownLaundryExclude, "handling for unknown laundry: exclude or watchlist")
 	enrichDetails := flags.Bool("enrich-details", false, "fetch each property page and add normalized rental details")
+	verifyRecency := flags.Bool("verify-recency", false, "fetch expanded unit pages to backfill days/listed/updated dates")
 	detailWorkers := flags.Int("detail-workers", 1, "concurrent property-detail requests (1-8)")
 	detailDelay := flags.Duration("detail-delay", 750*time.Millisecond, "minimum delay between property-detail request starts")
 	locationDelay := flags.Duration("location-delay", 2*time.Second, "delay between locations in a multi-location search")
+	maxPages := flags.Int("max-pages", 1, "maximum server-result pages per location route (1-20)")
+	pageDelay := flags.Duration("page-delay", 2*time.Second, "delay between server-result page requests")
+	var bedRangeValues stringListFlag
+	flags.Var(&bedRangeValues, "bed-range", "server bedroom range; repeat or use commas: 2, 3+, 2-4")
+	var serverSortValues stringListFlag
+	flags.Var(&serverSortValues, "server-sort", "server sort value such as days or mostrecentchange; repeat as needed")
+	supplementalNoLaundry := flags.Bool("supplemental-no-laundry", false, "add bounded routes without Zillow's indexed laundry filter")
+	supplementalPages := flags.Int("supplemental-pages", 1, "page cap for supplemental and keyword routes")
+	var keywordRouteValues stringListFlag
+	flags.Var(&keywordRouteValues, "keyword-route", "supplemental exact-2-bedroom Zillow keyword route; repeat as needed")
+	var homeTypeValues stringListFlag
+	flags.Var(&homeTypeValues, "home-type", "allowed home type; repeat or use commas: apartment, condo, townhouse, single-family")
+	var locationPageValues stringListFlag
+	flags.Var(&locationPageValues, "location-max-pages", "per-location page cap as LOCATION=PAGES; repeat as needed")
 	locationRetries := flags.Int("location-retries", 2, "retries after a challenge or rate limit")
 	retryBackoff := flags.Duration("retry-backoff", 30*time.Second, "initial cooldown before retrying a challenged location")
 	noCache := flags.Bool("no-cache", false, "disable shared search and property caches")
 	searchCacheTTL := flags.Duration("search-cache-ttl", time.Hour, "freshness window for cached location results")
 	propertyCacheTTL := flags.Duration("property-cache-ttl", 6*time.Hour, "freshness window for cached property details")
-	sortValue := flags.String("sort", "", "raw Zillow sort value (direct profile mode only)")
+	sortValue := flags.String("sort", "", "raw Zillow sort value for profile or location discovery")
 	sortByValue := flags.String("sort-by", "recommended", "local sort: recommended, price-asc, price-desc, newest, beds-desc, or sqft-desc")
 	limit := flags.Int("limit", 0, "maximum listings printed (0 prints all returned)")
 	timeout := flags.Duration("timeout", zillow.DefaultTimeout, "HTTP request timeout")
 	includeRaw := flags.Bool("raw", false, "include the raw JSON response in JSON output")
+	previousResultsPath := flags.String("previous-results", "", "prior JSON/JSONL results for new/changed/still-active labels")
 	if err := flags.Parse(args); err != nil {
 		return &usageError{err: err}
 	}
@@ -104,6 +133,15 @@ func (searchCommand) Run(ctx Context, args []string) error {
 	if err != nil {
 		return usagef("search --location: %v", err)
 	}
+	allowedCities, err := parseAllowedCities(allowedCityValues)
+	if err != nil {
+		return usagef("search --allowed-city: %v", err)
+	}
+	locationCityAliases, err := parseLocationCityAliases(locationCityAliasValues)
+	if err != nil {
+		return usagef("search --location-city-alias: %v", err)
+	}
+	boundaryOptions := locationBoundaryOptions{Strict: *strictLocationBoundary, AllowedCities: allowedCities, CityAliases: locationCityAliases}
 	profileSet := strings.TrimSpace(*profilePath) != ""
 	snapshotSet := strings.TrimSpace(*snapshotPath) != ""
 	locationSet := len(locations) > 0
@@ -112,6 +150,9 @@ func (searchCommand) Run(ctx Context, args []string) error {
 	}
 	if *forRent && !locationSet {
 		return usagef("search --rent is only valid with --location")
+	}
+	if !locationSet && (*strictLocationBoundary || len(allowedCityValues) > 0 || len(locationCityAliasValues) > 0) {
+		return usagef("search location boundary flags require --location")
 	}
 	if *limit < 0 {
 		return usagef("search --limit must be non-negative")
@@ -139,19 +180,31 @@ func (searchCommand) Run(ctx Context, args []string) error {
 	if err != nil {
 		return usagef("--flex: %v", err)
 	}
+	homeTypes, err := parseHomeTypes(homeTypeValues)
+	if err != nil {
+		return usagef("--home-type: %v", err)
+	}
 	detailOptions := detailFilterOptions{
-		Enrich:          *enrichDetails,
-		Workers:         *detailWorkers,
-		Delay:           *detailDelay,
-		MinSqft:         *minSqft,
-		MaxDaysOnZillow: *maxDaysOnZillow,
-		AvailableFrom:   availableFrom,
-		AvailableBy:     availableBy,
-		Laundry:         normalizeDetailChoice(*laundryValue),
-		Parking:         normalizeDetailChoice(*parkingValue),
-		Pets:            normalizeDetailChoice(*petsValue),
-		Flex:            flex,
-		UnknownLaundry:  normalizeDetailChoice(*unknownLaundryValue),
+		Enrich:                  *enrichDetails,
+		VerifyRecency:           *verifyRecency,
+		Workers:                 *detailWorkers,
+		Delay:                   *detailDelay,
+		MinSqft:                 *minSqft,
+		MaxDaysOnZillow:         *maxDaysOnZillow,
+		AvailableFrom:           availableFrom,
+		AvailableBy:             availableBy,
+		UnknownAvailability:     normalizeDetailChoice(*unknownAvailabilityValue),
+		OutOfWindowAvailability: normalizeDetailChoice(*outOfWindowAvailabilityValue),
+		MaxTotalCost:            *maxTotalCost,
+		RequireForRent:          *verifyRentalStatus,
+		ExcludeSharedHousing:    *excludeSharedHousing,
+		ExcludeStudentHousing:   *excludeStudentHousing,
+		ExcludeIncomeRestricted: *excludeIncomeRestricted,
+		Laundry:                 normalizeDetailChoice(*laundryValue),
+		Parking:                 normalizeDetailChoice(*parkingValue),
+		Pets:                    normalizeDetailChoice(*petsValue),
+		Flex:                    flex,
+		UnknownLaundry:          normalizeDetailChoice(*unknownLaundryValue),
 	}
 	if err := validateDetailFilterOptions(detailOptions); err != nil {
 		return usagef("%v", err)
@@ -162,6 +215,18 @@ func (searchCommand) Run(ctx Context, args []string) error {
 	}
 	if *locationDelay < 0 {
 		return usagef("location-delay must not be negative")
+	}
+	if *pageDelay < 0 {
+		return usagef("page-delay must not be negative")
+	}
+	if *maxPages < 1 || *maxPages > maxLocationDiscoveryPages {
+		return usagef("max-pages must be between 1 and %d", maxLocationDiscoveryPages)
+	}
+	if *supplementalPages < 1 || *supplementalPages > *maxPages {
+		return usagef("supplemental-pages must be between 1 and max-pages %d", *maxPages)
+	}
+	if strings.TrimSpace(*sortValue) != "" && len(serverSortValues) > 0 {
+		return usagef("search --sort and --server-sort cannot be combined")
 	}
 	if *searchCacheTTL < 0 || *propertyCacheTTL < 0 {
 		return usagef("cache TTL values must not be negative")
@@ -175,25 +240,75 @@ func (searchCommand) Run(ctx Context, args []string) error {
 	}
 
 	filters := zillow.SearchFilters{
-		Page:     *page,
-		MinPrice: *minPrice,
-		MaxPrice: *maxPrice,
-		MinBeds:  *minBeds,
-		MinBaths: *minBaths,
-		Sort:     *sortValue,
+		Page:      *page,
+		MinPrice:  *minPrice,
+		MaxPrice:  *maxPrice,
+		MinBeds:   *minBeds,
+		MaxBeds:   *maxBeds,
+		MinBaths:  *minBaths,
+		Sort:      *sortValue,
+		HomeTypes: append([]string(nil), homeTypes...),
+	}
+	discoveryRequested := locationSet && (*maxPages > 1 || len(bedRangeValues) > 0 || len(serverSortValues) > 0 || len(homeTypes) > 0 || len(locationPageValues) > 0 || *supplementalNoLaundry || len(keywordRouteValues) > 0 || filters.Sort != "")
+	if !locationSet && (*maxPages != 1 || len(bedRangeValues) > 0 || len(serverSortValues) > 0 || len(locationPageValues) > 0 || *supplementalNoLaundry || len(keywordRouteValues) > 0) {
+		return usagef("search discovery and supplemental route flags require --location")
+	}
+	if snapshotSet && (filters.Page != 0 || filters.Sort != "") {
+		return usagef("search --page and --sort require --profile; snapshots contain one captured page")
+	}
+	if locationSet && filters.Page != 0 {
+		return usagef("search --page requires --profile; use --max-pages with --location")
 	}
 	if !profileSet {
-		if filters.Page != 0 || filters.Sort != "" {
-			if snapshotSet {
-				return usagef("search --page and --sort require --profile; snapshots contain one captured page")
-			}
-			return usagef("search --page and --sort are not yet supported with --location")
-		}
 		if err := validateSnapshotFilters(filters); err != nil {
 			if snapshotSet {
 				return usagef("search snapshot filters: %v", err)
 			}
 			return usagef("search location filters: %v", err)
+		}
+	}
+	if discoveryRequested && *includeRaw {
+		return usagef("search --raw is not supported with paginated location discovery")
+	}
+	var discoveryOptions zillow.DiscoveryOptions
+	var locationPageOverrides map[string]int
+	if discoveryRequested {
+		discoveryOptions, err = buildLocationDiscoveryOptions(locationDiscoveryConfig{
+			MaxPages:              *maxPages,
+			PageDelay:             *pageDelay,
+			BedRanges:             bedRangeValues,
+			ServerSorts:           serverSortValues,
+			HomeTypes:             homeTypes,
+			ForRent:               *forRent,
+			InUnitLaundry:         detailOptions.Laundry == zillow.LaundryInUnit,
+			SupplementalNoLaundry: *supplementalNoLaundry,
+			SupplementalPages:     *supplementalPages,
+			KeywordRoutes:         keywordRouteValues,
+			BaseFilters:           filters,
+		})
+		if err != nil {
+			return usagef("search discovery: %v", err)
+		}
+		locationPageOverrides, err = parseLocationPageOverrides(locationPageValues, *maxPages)
+		if err != nil {
+			return usagef("search --location-max-pages: %v", err)
+		}
+		knownLocations := make(map[string]struct{}, len(locations))
+		for _, location := range locations {
+			knownLocations[strings.ToLower(strings.TrimSpace(location))] = struct{}{}
+		}
+		for location := range locationPageOverrides {
+			if _, exists := knownLocations[location]; !exists {
+				return usagef("search --location-max-pages references an unknown location %q", location)
+			}
+		}
+	}
+
+	var previousListings []zillow.Listing
+	if strings.TrimSpace(*previousResultsPath) != "" {
+		previousListings, err = readPreviousListings(*previousResultsPath)
+		if err != nil {
+			return err
 		}
 	}
 
@@ -236,21 +351,29 @@ func (searchCommand) Run(ctx Context, args []string) error {
 		}
 		return listings
 	}
+	annotateHistory := func(listings []zillow.Listing) []zillow.Listing {
+		if strings.TrimSpace(*previousResultsPath) == "" {
+			return listings
+		}
+		return zillow.AnnotateListingHistory(listings, previousListings)
+	}
 	processListings := func(listings []zillow.Listing) []zillow.Listing {
 		listings = filterSnapshotListings(listings, filters)
 		if enricher == nil {
-			return applySortAndLimit(filterDetailedListings(listings, detailOptions, today))
+			return annotateHistory(applySortAndLimit(filterDetailedListings(listings, detailOptions, today)))
 		}
 		if !detailOptions.requiresAmenityDetails() {
-			listings = filterDetailedListings(listings, detailOptions, today)
 			listings = applySortAndLimit(listings)
-			enricher.Enrich(requestContext, listings)
-			return listings
+		} else {
+			listings = prefilterKnownListingMetadata(listings, detailOptions, today)
 		}
-		listings = prefilterKnownListingMetadata(listings, detailOptions, today)
-		enricher.Enrich(requestContext, listings)
+		listings = enricher.Enrich(requestContext, listings)
+		if detailOptions.VerifyRecency {
+			listings = enricher.EnrichRecency(requestContext, listings)
+		}
+		listings = filterSnapshotListings(listings, filters)
 		listings = filterDetailedListings(listings, detailOptions, today)
-		return applySortAndLimit(listings)
+		return annotateHistory(applySortAndLimit(listings))
 	}
 
 	var result *zillow.SearchResult
@@ -296,7 +419,8 @@ func (searchCommand) Run(ctx Context, args []string) error {
 				areaResults = append(areaResults, locationSearchResult{Location: location, Error: buildErr.Error()})
 				continue
 			}
-			cacheKey := fmt.Sprintf("%s|raw=%t", target, *includeRaw)
+			locationDiscoveryOptions := applyLocationPageOverride(discoveryOptions, location, locationPageOverrides)
+			cacheKey := fmt.Sprintf("%s|raw=%t|discovery=%t|options=%v", target, *includeRaw, discoveryRequested, locationDiscoveryOptions)
 			var areaResult *zillow.SearchResult
 			if searchResultCache != nil {
 				var cached zillow.SearchResult
@@ -307,6 +431,7 @@ func (searchCommand) Run(ctx Context, args []string) error {
 				}
 			}
 			var fetchErr error
+			cacheableResult := true
 			if areaResult == nil {
 				if liveLocationRequests > 0 {
 					if sleepErr := sleepContext(requestContext, *locationDelay); sleepErr != nil {
@@ -315,9 +440,30 @@ func (searchCommand) Run(ctx Context, args []string) error {
 				}
 				liveLocationRequests++
 				areaResult, fetchErr = fetchWithRetry(requestContext, retryOptions, func() (*zillow.SearchResult, error) {
-					return client.FetchSearchPageWithOptions(requestContext, target, zillow.SearchPageOptions{IncludeRaw: *includeRaw})
+					if !discoveryRequested {
+						return client.FetchSearchPageWithOptions(requestContext, target, zillow.SearchPageOptions{IncludeRaw: *includeRaw})
+					}
+					discovered, discoverErr := client.DiscoverLocation(requestContext, target, locationDiscoveryOptions)
+					if discoverErr != nil {
+						return nil, discoverErr
+					}
+					if len(discovered.Issues) > 0 {
+						cacheableResult = false
+					}
+					for _, issue := range discovered.Issues {
+						_, _ = fmt.Fprintf(ctx.Stderr, "warning: location %q route %q page %d failed: %s\n", location, issue.Route, issue.Page, issue.Error)
+					}
+					for _, coverage := range discovered.Coverage {
+						if !coverage.Complete {
+							_, _ = fmt.Fprintf(ctx.Stderr, "warning: location %q route %q stopped after %d of %d reported pages\n", location, coverage.Route, coverage.PagesFetched, coverage.TotalPages)
+						}
+					}
+					if len(discovered.Listings) == 0 && len(discovered.Issues) > 0 {
+						return nil, errors.New(discovered.Issues[0].Error)
+					}
+					return &zillow.SearchResult{Listings: discovered.Listings, Metadata: zillow.SearchMetadata{Returned: len(discovered.Listings)}}, nil
 				})
-				if fetchErr == nil && searchResultCache != nil {
+				if fetchErr == nil && cacheableResult && searchResultCache != nil {
 					if cacheErr := searchResultCache.Save(cacheKey, areaResult); cacheErr != nil {
 						_, _ = fmt.Fprintf(ctx.Stderr, "warning: location %q cache write failed: %v\n", location, cacheErr)
 					}
@@ -332,7 +478,9 @@ func (searchCommand) Run(ctx Context, args []string) error {
 				areaResults = append(areaResults, locationSearchResult{Location: location, Error: message})
 				continue
 			}
-			if expectedState := locationStateQualifier(location); expectedState != "" {
+			if *strictLocationBoundary || len(allowedCities) > 0 {
+				areaResult.Listings = filterListingsByLocationBoundary(areaResult.Listings, location, boundaryOptions, true)
+			} else if expectedState := locationStateQualifier(location); expectedState != "" {
 				originalCount := len(areaResult.Listings)
 				areaResult.Listings = filterListingsByState(areaResult.Listings, expectedState)
 				if originalCount > 0 && len(areaResult.Listings) == 0 {
@@ -345,6 +493,9 @@ func (searchCommand) Run(ctx Context, args []string) error {
 				}
 			}
 			areaResult.Listings = processListings(areaResult.Listings)
+			if *strictLocationBoundary || len(allowedCities) > 0 {
+				areaResult.Listings = filterListingsByLocationBoundary(areaResult.Listings, location, boundaryOptions, false)
+			}
 			areaResult.Metadata.Returned = len(areaResult.Listings)
 			areaResults = append(areaResults, locationSearchResult{
 				Location: location,
@@ -393,6 +544,9 @@ func writeSearchUsage(w interface{ Write([]byte) (int, error) }) {
 
 Sources:
   --location <place>       Location/ZIP; repeat or use commas for multiple values
+  --strict-location-boundary Require exact ZIP/city result matches
+  --allowed-city <name>     Allowed result city; repeat or use commas
+  --location-city-alias <q=c> Map a query name to an accepted postal city
   --rent                   Search rentals; valid with --location
   --profile <file>         Derived profile for best-effort direct HTTP
   --snapshot <file>        Saved HTML or raw __NEXT_DATA__ JSON; use - for stdin
@@ -406,11 +560,19 @@ Listing filters:
   --min-price <n>          Minimum price
   --max-price <n>          Maximum price
   --min-beds <n>           Minimum bedrooms
+  --max-beds <n>           Maximum bedrooms
   --min-baths <n>          Minimum bathrooms
   --min-sqft <n>           Minimum living area in square feet
   --max-days-on-zillow <n> Maximum days on Zillow; -1 disables the filter
   --available-from <date>  Earliest availability date, YYYY-MM-DD
   --available-by <date>    Latest availability date, YYYY-MM-DD
+  --unknown-availability <mode> exclude or watchlist
+  --out-of-window-availability <mode> exclude or watchlist
+  --max-total-cost <n>     Maximum monthly cost including known required fees
+  --verify-rental-status   Confirm FOR_RENT status from the property page
+  --exclude-shared-housing Exclude room-by-room and co-living listings
+  --exclude-student-housing Exclude student and dorm-style housing
+  --exclude-income-restricted Exclude listings with income eligibility limits
   --laundry <value>        any, in-unit, hookups, shared, none, or unknown
   --parking <value>        any, available, garage, private-garage, none, or unknown
   --pets <value>           any, allowed, dogs, cats, none, or unknown
@@ -420,10 +582,20 @@ Listing filters:
 
 Detail enrichment:
   --enrich-details         Fetch each property page and add normalized rental details
+  --verify-recency         Fetch expanded unit pages for actual recency fields
   --detail-workers <n>     Concurrent detail requests, 1-8 (default 1)
   --detail-delay <duration> Minimum delay between detail request starts (default 750ms)
                            Laundry, parking, pets, and flex filters enable enrichment automatically
   --location-delay <d>     Delay between locations (default 2s)
+  --max-pages <n>          Maximum pages per server route, 1-20 (default 1)
+  --page-delay <d>         Delay between server-result pages (default 2s)
+  --bed-range <range>      Server bedroom route; repeat: 2, 3+, 2-4
+  --server-sort <value>    Server sort route; repeat: days, mostrecentchange
+  --supplemental-no-laundry Add routes without Zillow's indexed laundry flag
+  --supplemental-pages <n> Page cap for supplemental/keyword routes
+  --keyword-route <text>  Exact-2-bedroom keyword route; repeat as needed
+  --home-type <value>      apartment, condo, townhouse, or single-family
+  --location-max-pages <spec> Per-location cap as LOCATION=PAGES
   --location-retries <n>   Retries after challenge/rate-limit responses (default 2)
   --retry-backoff <d>      Initial retry cooldown, doubled per attempt (default 30s)
   --search-cache-ttl <d>   Reuse location results across commands (default 1h)
@@ -432,11 +604,12 @@ Detail enrichment:
 
 Result controls:
   --page <n>               Results page; direct profile mode only
-  --sort <value>           Raw Zillow sort value; direct profile mode only
+  --sort <value>           Raw Zillow sort value; profile or location discovery
   --sort-by <value>        recommended, price-asc, price-desc, newest, beds-desc, or sqft-desc
   --limit <n>              Maximum rows per location; 0 prints all returned
   --timeout <duration>     HTTP timeout per request (default 20s)
   --raw                    Include raw search response JSON in JSON output
+  --previous-results <path> Prior JSON/JSONL for new/changed/still-active labels
 `))
 }
 
@@ -489,8 +662,11 @@ func printMultiLocationResult(printer *output.Printer, mode output.Mode, result 
 }
 
 type listingTableColumns struct {
-	Details bool
-	Match   bool
+	Details      bool
+	Cost         bool
+	Match        bool
+	History      bool
+	Verification bool
 }
 
 func multiLocationTable(result multiLocationSearchResult) output.Table {
@@ -601,11 +777,14 @@ func validateSnapshotFilters(filters zillow.SearchFilters) error {
 	if filters.MinPrice > 0 && filters.MaxPrice > 0 && filters.MinPrice > filters.MaxPrice {
 		return errors.New("minimum price must not exceed maximum price")
 	}
-	if math.IsNaN(filters.MinBeds) || math.IsInf(filters.MinBeds, 0) || math.IsNaN(filters.MinBaths) || math.IsInf(filters.MinBaths, 0) {
+	if math.IsNaN(filters.MinBeds) || math.IsInf(filters.MinBeds, 0) || math.IsNaN(filters.MaxBeds) || math.IsInf(filters.MaxBeds, 0) || math.IsNaN(filters.MinBaths) || math.IsInf(filters.MinBaths, 0) {
 		return errors.New("bed and bath filters must be finite")
 	}
-	if filters.MinBeds < 0 || filters.MinBaths < 0 {
+	if filters.MinBeds < 0 || filters.MaxBeds < 0 || filters.MinBaths < 0 {
 		return errors.New("bed and bath filters must not be negative")
+	}
+	if filters.MinBeds > 0 && filters.MaxBeds > 0 && filters.MinBeds > filters.MaxBeds {
+		return errors.New("minimum beds must not exceed maximum beds")
 	}
 	return nil
 }
@@ -613,21 +792,58 @@ func validateSnapshotFilters(filters zillow.SearchFilters) error {
 func filterSnapshotListings(listings []zillow.Listing, filters zillow.SearchFilters) []zillow.Listing {
 	filtered := make([]zillow.Listing, 0, len(listings))
 	for _, listing := range listings {
-		if filters.MinPrice > 0 && (listing.Price == nil || *listing.Price < filters.MinPrice) {
-			continue
+		if filters.MinPrice > 0 {
+			if (listing.Price == nil && !listing.IsBuilding) || (listing.Price != nil && *listing.Price < filters.MinPrice) {
+				continue
+			}
 		}
-		if filters.MaxPrice > 0 && (listing.Price == nil || *listing.Price > filters.MaxPrice) {
-			continue
+		if filters.MaxPrice > 0 {
+			if (listing.Price == nil && !listing.IsBuilding) || (listing.Price != nil && *listing.Price > filters.MaxPrice) {
+				continue
+			}
 		}
-		if filters.MinBeds > 0 && (listing.Bedrooms == nil || *listing.Bedrooms < filters.MinBeds) {
-			continue
+		if !listing.IsBuilding {
+			if filters.MinBeds > 0 && (listing.Bedrooms == nil || *listing.Bedrooms < filters.MinBeds) {
+				continue
+			}
+			if filters.MaxBeds > 0 && (listing.Bedrooms == nil || *listing.Bedrooms > filters.MaxBeds) {
+				continue
+			}
+			if filters.MinBaths > 0 && (listing.Bathrooms == nil || *listing.Bathrooms < filters.MinBaths) {
+				continue
+			}
 		}
-		if filters.MinBaths > 0 && (listing.Bathrooms == nil || *listing.Bathrooms < filters.MinBaths) {
+		if len(filters.HomeTypes) > 0 && !listingHomeTypeMatches(listing.HomeType, filters.HomeTypes) {
 			continue
 		}
 		filtered = append(filtered, listing)
 	}
 	return filtered
+}
+
+func listingHomeTypeMatches(value string, allowed []string) bool {
+	normalized := strings.ToUpper(strings.TrimSpace(value))
+	for _, candidate := range allowed {
+		switch candidate {
+		case zillow.HomeTypeApartment:
+			if normalized == "APARTMENT" {
+				return true
+			}
+		case zillow.HomeTypeCondo:
+			if normalized == "CONDO" || normalized == "CONDOMINIUM" || normalized == "CONDO_COOP" || normalized == "COOP" {
+				return true
+			}
+		case zillow.HomeTypeTownhouse:
+			if normalized == "TOWNHOUSE" || normalized == "TOWNHOME" {
+				return true
+			}
+		case zillow.HomeTypeSingleFamily:
+			if normalized == "SINGLE_FAMILY" || normalized == "HOUSE" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func searchTable(listings []zillow.Listing) output.Table {
@@ -640,12 +856,22 @@ func searchTable(listings []zillow.Listing) output.Table {
 }
 
 func listingTableHeaders(columns listingTableColumns) []string {
-	headers := []string{"ZPID", "PRICE", "BEDS", "BATHS", "SQFT", "DAYS", "AVAILABLE"}
+	headers := []string{"ZPID", "PRICE"}
+	if columns.Cost {
+		headers = append(headers, "FEES", "TOTAL")
+	}
+	headers = append(headers, "BEDS", "BATHS", "SQFT", "DAYS", "AVAILABLE")
 	if columns.Details {
 		headers = append(headers, "YEAR", "LAUNDRY", "PARKING", "PETS", "FLEX")
 	}
 	if columns.Match {
 		headers = append(headers, "MATCH")
+	}
+	if columns.History {
+		headers = append(headers, "HISTORY", "CHANGES")
+	}
+	if columns.Verification {
+		headers = append(headers, "VERIFY")
 	}
 	return append(headers, "ADDRESS", "URL")
 }
@@ -654,12 +880,17 @@ func listingTableRow(listing zillow.Listing, columns listingTableColumns) []stri
 	row := []string{
 		listing.ID,
 		formatMoney(listing.Price, listing.PriceText),
+	}
+	if columns.Cost {
+		row = append(row, formatMoney(listing.RequiredMonthlyFees, ""), formatMoney(listing.TotalMonthlyCost, ""))
+	}
+	row = append(row,
 		formatFloat(listing.Bedrooms),
 		formatFloat(listing.Bathrooms),
 		formatInteger(listing.LivingArea),
 		formatInteger(listing.DaysOnZillow),
 		listing.Availability,
-	}
+	)
 	if columns.Details {
 		row = append(row,
 			formatPlainInteger(listing.YearBuilt),
@@ -672,6 +903,12 @@ func listingTableRow(listing zillow.Listing, columns listingTableColumns) []stri
 	if columns.Match {
 		row = append(row, listing.MatchStatus)
 	}
+	if columns.History {
+		row = append(row, listing.HistoryStatus, strings.Join(listing.HistoryChanges, ","))
+	}
+	if columns.Verification {
+		row = append(row, strings.Join(listing.VerificationNotes, ","))
+	}
 	return append(row, formatAddress(listing.Address), listing.URL)
 }
 
@@ -682,15 +919,30 @@ func listingColumns(listings []zillow.Listing) listingTableColumns {
 			len(listing.FlexSpaces) > 0 || listing.YearBuilt != nil {
 			columns.Details = true
 		}
+		if listing.RequiredMonthlyFees != nil || listing.TotalMonthlyCost != nil || listing.PriceIncludesRequiredFees != nil {
+			columns.Cost = true
+		}
 		if listing.MatchStatus != "" {
 			columns.Match = true
+		}
+		if listing.HistoryStatus != "" || len(listing.HistoryChanges) > 0 {
+			columns.History = true
+		}
+		if len(listing.VerificationNotes) > 0 {
+			columns.Verification = true
 		}
 	}
 	return columns
 }
 
 func mergeListingTableColumns(left, right listingTableColumns) listingTableColumns {
-	return listingTableColumns{Details: left.Details || right.Details, Match: left.Match || right.Match}
+	return listingTableColumns{
+		Details:      left.Details || right.Details,
+		Cost:         left.Cost || right.Cost,
+		Match:        left.Match || right.Match,
+		History:      left.History || right.History,
+		Verification: left.Verification || right.Verification,
+	}
 }
 func explainZillowError(err error) error {
 	switch {
