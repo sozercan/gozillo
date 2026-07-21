@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "endpoint": "https://www.zillow.com/async-create-search-page-state",
+  "method": "PUT",
+  "referer": "https://www.zillow.com/homes/Synthetic-City/?keep=yes",
+  "searchQueryState": {
+    "filterState": {
+      "sortSelection": {
+        "value": "globalrelevanceex"
+      }
+    },
+    "mapBounds": {
+      "east": -9.5,
+      "north": 21.25,
+      "south": 20.25,
+      "west": -10.5
+    },
+    "usersSearchTerm": "Synthetic City"
+  },
+  "wants": {
+    "cat1": [
+      "listResults"
+    ],
+    "cat2": [
+      "mapResults"
+    ]
+  }
+}

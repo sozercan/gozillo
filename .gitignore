@@ -1,0 +1,10 @@
+.DS_Store
+/gozillo
+*.raw.har
+captures/raw/
+.gozillo/
+coverage.out
+
+/reports/
+
+/examples/

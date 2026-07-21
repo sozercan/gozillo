@@ -1,0 +1,92 @@
+[
+  {
+    "entryIndex": 2,
+    "score": 277,
+    "method": "PUT",
+    "url": "https://www.zillow.com/async-create-search-page-state",
+    "host": "www.zillow.com",
+    "path": "/async-create-search-page-state",
+    "resourceType": "xhr",
+    "requestMimeType": "application/json; charset=utf-8",
+    "responseMimeType": "application/json",
+    "reasons": [
+      "+40 first-party Zillow host",
+      "+140 search-state endpoint",
+      "+35 fetch/XHR",
+      "+30 JSON response",
+      "+15 JSON request",
+      "+12 PUT",
+      "+5 successful response"
+    ]
+  },
+  {
+    "entryIndex": 1,
+    "score": 125,
+    "method": "POST",
+    "url": "https://www.zillow.com/graphql/?operationName=SearchPreview",
+    "host": "www.zillow.com",
+    "path": "/graphql/",
+    "resourceType": "fetch",
+    "requestMimeType": "application/json",
+    "responseMimeType": "application/json",
+    "reasons": [
+      "+40 first-party Zillow host",
+      "+35 fetch/XHR",
+      "+30 JSON response",
+      "+15 JSON request",
+      "+5 successful response"
+    ]
+  },
+  {
+    "entryIndex": 0,
+    "score": 5,
+    "method": "POST",
+    "url": "https://www.zillow.com/events",
+    "host": "www.zillow.com",
+    "path": "/events",
+    "resourceType": "xhr",
+    "requestMimeType": "application/json",
+    "responseMimeType": "application/json",
+    "reasons": [
+      "+40 first-party Zillow host",
+      "-120 analytics/telemetry",
+      "+35 fetch/XHR",
+      "+30 JSON response",
+      "+15 JSON request",
+      "+5 successful response"
+    ]
+  },
+  {
+    "entryIndex": 3,
+    "score": -141,
+    "method": "GET",
+    "url": "https://www.zillowstatic.com/static/app.js",
+    "host": "www.zillowstatic.com",
+    "path": "/static/app.js",
+    "resourceType": "script",
+    "responseMimeType": "application/javascript",
+    "reasons": [
+      "-60 non-Zillow host",
+      "-90 static asset",
+      "+4 GET",
+      "+5 successful response"
+    ]
+  },
+  {
+    "entryIndex": 4,
+    "score": -255,
+    "method": "POST",
+    "url": "https://metrics.example.test/collect",
+    "host": "metrics.example.test",
+    "path": "/collect",
+    "resourceType": "beacon",
+    "requestMimeType": "application/x-www-form-urlencoded",
+    "responseMimeType": "text/plain",
+    "reasons": [
+      "-60 non-Zillow host",
+      "-120 analytics/telemetry",
+      "-80 beacon/ping",
+      "+5 successful response"
+    ]
+  }
+]
