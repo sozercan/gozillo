@@ -11,7 +11,7 @@
 `gozillo` searches locations, filters listings, fetches structured property
 details, and prints clean table, JSON, or JSONL output. Live requests use a
 [`tls-client`](https://github.com/bogdanfinn/tls-client) browser profile and can
-reuse cookies from a Chrome HAR capture.
+reuse cookies from a fresh browser HAR capture.
 
 > Zillow's website endpoints are private and unsupported. They may change
 > without notice. Use the tool conservatively and respect the site's terms,
@@ -38,12 +38,12 @@ go build -o gozillo ./cmd/gozillo
 
 ## Quick start
 
-### 1. Capture a non-sanitized HAR in Chrome
+### 1. Capture a non-sanitized HAR in Edge or Chrome
 
-Chrome removes cookies and authorization data from sanitized HAR exports. A
-session import needs the **non-sanitized** export:
+Edge and Chrome omit cookies and authorization data from sanitized HAR
+exports. A session import needs the **non-sanitized** export:
 
-1. Open Zillow in Chrome and open DevTools:
+1. Open Zillow in Microsoft Edge or Google Chrome and open DevTools:
    - macOS: **Command+Option+I**
    - Windows/Linux: **Ctrl+Shift+I**
 2. Select the **Network** panel.
@@ -54,8 +54,10 @@ session import needs the **non-sanitized** export:
 6. Complete the normal browser flow and wait for the page to finish loading.
 7. Open **Export HAR** and select **Export HAR (with sensitive data)**.
 
-Chrome documents this flow in its
-[Network panel reference](https://developer.chrome.com/docs/devtools/network/reference/#save-as-har).
+The same Chromium DevTools flow is documented in the
+[Microsoft Edge Network reference](https://learn.microsoft.com/en-us/microsoft-edge/devtools/network/reference#save-all-network-requests-to-a-har-file)
+and the
+[Chrome Network reference](https://developer.chrome.com/docs/devtools/network/reference/#save-as-har).
 
 Save the capture somewhere private:
 
@@ -80,29 +82,35 @@ User-Agent.
 
 ### 3. Search
 
-Live requests require a `tls-client` profile:
+Live requests require a `tls-client` profile. Start with the nearest profile
+for the captured browser family, but treat profile selection as a compatibility
+test rather than a strict browser-name match:
 
 ```bash
 LOCATION='Example City ST'
-TLS_PROFILE=chrome_146
+TLS_PROFILE='<working tls-client profile>'
+CAPTURED_UA='<User-Agent from the successful browser request>'
 
 gozillo search \
   --location "$LOCATION" \
   --rent \
   --session default \
-  --tls-profile "$TLS_PROFILE"
+  --tls-profile "$TLS_PROFILE" \
+  --user-agent "$CAPTURED_UA"
 ```
 
-Use an explicitly state-qualified city name when possible.
+Use an explicitly state-qualified city name when possible. Add the matching
+navigation headers described below when the captured browser sent them.
 
 ## Browser identity
 
-Some sessions also expect the TLS profile, User-Agent, and browser navigation
-headers to agree. Those values must be supplied explicitly:
+A TLS profile, User-Agent, and browser navigation headers are separate parts
+of the request. Keep the User-Agent and client hints exactly as captured from a
+successful browser request. Do not rewrite them to match the TLS profile name.
+For a Chromium-family capture, the additional flags may look like:
 
 ```bash
-CAPTURED_UA='...'
-SEC_CH_UA='...'
+SEC_CH_UA='<Sec-CH-UA value from the successful browser request>'
 
 gozillo search \
   --location "$LOCATION" \
@@ -120,8 +128,15 @@ gozillo search \
 authorization, User-Agent, origin, referrer, and host headers cannot be supplied
 through it.
 
-Browser releases may be newer than the profiles bundled with `tls-client`.
-Choose the nearest profile in the same browser family.
+An Edge User-Agent contains a Chrome compatibility token but still identifies
+itself as Edge, and its client hints may do the same. A Safari-named TLS profile
+does not turn the captured User-Agent into Safari.
+
+Start with the nearest family profile—Chrome-family for Edge or Chrome,
+Safari-family for Safari, and Firefox-family for Firefox. Browser releases may
+be newer than the bundled profiles, and the nearest profile is only a
+best-effort starting point. If it is rejected, keep the captured User-Agent and
+headers unchanged while testing another available profile.
 
 ## Search examples
 
@@ -254,9 +269,10 @@ snapshots and local HTML do not.
 
 ### `X-Px-Blocked`
 
-Try a fresh HAR from a successful browser page load. If the browser session is
-identity-bound, also supply a matching browser-family profile, User-Agent, and
-allowlisted navigation headers. Avoid repeating the same failing routes across
+Try a fresh HAR from a successful browser page load. Keep the captured
+User-Agent and allowlisted navigation headers exact. Start with the nearest
+browser-family TLS profile, but if it is rejected, test another profile while
+changing only that one variable. Avoid repeating the same failing routes across
 many separate commands.
 
 ### Missing listings

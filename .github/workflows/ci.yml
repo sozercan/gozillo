@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Go checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      GOFLAGS: -mod=readonly
+      GOTOOLCHAIN: local
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Check repository data boundary
+        shell: bash
+        run: |
+          forbidden="$(
+            git ls-files \
+              | grep -E '(^|/)(captures|reports)/|\.raw\.har$|(^|/)zillow\.har$' \
+              || true
+          )"
+          if [[ -n "$forbidden" ]]; then
+            printf 'Forbidden raw or generated data is tracked:\n%s\n' "$forbidden"
+            exit 1
+          fi
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Verify modules
+        run: go mod verify
+
+      - name: Check formatting
+        shell: bash
+        run: |
+          files="$(gofmt -l .)"
+          if [[ -n "$files" ]]; then
+            printf 'The following files need gofmt:\n%s\n' "$files"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test with race detector
+        run: go test -race -count=1 ./...
+
+      - name: Build CLI
+        run: go build -trimpath -o "${RUNNER_TEMP}/gozillo" ./cmd/gozillo

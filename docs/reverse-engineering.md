@@ -46,7 +46,7 @@ persist the HAR, response bodies, authorization headers, or browser identity.
 Imported sessions are best-effort:
 
 - cookies may be short-lived;
-- cookies may be tied to the source IP, browser family, TLS fingerprint,
+- cookies may be tied to the source IP, browser identity, TLS fingerprint,
   navigation headers, or other browser state;
 - a capture that worked earlier may be rejected on its first later request;
 - there is no universal age threshold that guarantees validity.
@@ -114,17 +114,25 @@ through `--browser-header`:
 - `Origin` and `Referer`;
 - `Host` and content-routing headers.
 
-Browser versions can move ahead of the profiles bundled by `tls-client`.
-Selecting the nearest profile in the same browser family is best-effort; exact
-header/profile agreement improves compatibility but does not guarantee access
-or disable adaptive protections.
+The captured User-Agent and client hints are independent from the selected TLS
+profile. An Edge User-Agent includes a Chrome compatibility token while still
+identifying itself as Edge. Selecting a Safari-named TLS profile does not change
+that HTTP identity. Callers should preserve captured HTTP values exactly rather
+than rewriting them to match the profile name.
+
+Browser versions can move ahead of the profiles bundled by `tls-client`. The
+nearest profile in the same browser family is a reasonable starting point, not
+a strict requirement. Compatibility must be tested empirically while changing
+one layer at a time. No profile choice guarantees access or disables adaptive
+protections.
 
 Controlled compatibility testing showed that these layers are independently
-significant: fresh cookies plus a browser-family TLS profile and User-Agent may
+significant: fresh cookies plus a browser-shaped TLS profile and User-Agent may
 still be challenged when expected navigation headers are missing. Adding the
-matching non-credential client hints and navigation headers can change the
-outcome. This is evidence about request coherence, not a stable bypass or a
-guarantee that the same identity will remain accepted.
+captured non-credential client hints and navigation headers can change the
+outcome. Conversely, more than one TLS profile can work with the same captured
+HTTP identity. This is evidence about request compatibility, not a stable bypass
+or a guarantee that the same identity will remain accepted.
 
 ## `tls-client` adapter
 
