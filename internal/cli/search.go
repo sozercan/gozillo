@@ -107,8 +107,8 @@ func (searchCommand) Run(ctx Context, args []string) error {
 	flags.Var(&homeTypeValues, "home-type", "allowed home type; repeat or use commas: apartment, condo, townhouse, single-family")
 	var locationPageValues stringListFlag
 	flags.Var(&locationPageValues, "location-max-pages", "per-location page cap as LOCATION=PAGES; repeat as needed")
-	locationRetries := flags.Int("location-retries", 2, "retries after a challenge or rate limit")
-	retryBackoff := flags.Duration("retry-backoff", 30*time.Second, "initial cooldown before retrying a challenged location")
+	locationRetries := flags.Int("location-retries", 2, "retries per challenged or rate-limited request")
+	retryBackoff := flags.Duration("retry-backoff", 30*time.Second, "initial cooldown before retrying a challenged request")
 	noCache := flags.Bool("no-cache", false, "disable shared search and property caches")
 	searchCacheTTL := flags.Duration("search-cache-ttl", time.Hour, "freshness window for cached location results")
 	propertyCacheTTL := flags.Duration("property-cache-ttl", 6*time.Hour, "freshness window for cached property details")
@@ -118,6 +118,7 @@ func (searchCommand) Run(ctx Context, args []string) error {
 	timeout := flags.Duration("timeout", zillow.DefaultTimeout, "HTTP request timeout")
 	includeRaw := flags.Bool("raw", false, "include the raw JSON response in JSON output")
 	previousResultsPath := flags.String("previous-results", "", "prior JSON/JSONL results for new/changed/still-active labels")
+	showProgress := flags.Bool("progress", false, "write line-oriented progress updates to stderr")
 	if err := flags.Parse(args); err != nil {
 		return &usageError{err: err}
 	}
@@ -276,6 +277,8 @@ func (searchCommand) Run(ctx Context, args []string) error {
 		discoveryOptions, err = buildLocationDiscoveryOptions(locationDiscoveryConfig{
 			MaxPages:              *maxPages,
 			PageDelay:             *pageDelay,
+			RequestRetries:        retryOptions.Retries,
+			RetryBackoff:          retryOptions.Backoff,
 			BedRanges:             bedRangeValues,
 			ServerSorts:           serverSortValues,
 			HomeTypes:             homeTypes,
@@ -301,6 +304,15 @@ func (searchCommand) Run(ctx Context, args []string) error {
 			if _, exists := knownLocations[location]; !exists {
 				return usagef("search --location-max-pages references an unknown location %q", location)
 			}
+		}
+	}
+	progress := newSearchProgressLogger(*showProgress, ctx.Stderr)
+	if locationSet {
+		estimate := estimateMultiLocationSearchPlan(locations, discoveryRequested, discoveryOptions, locationPageOverrides, *locationDelay)
+		if discoveryRequested {
+			progress.printf("planned %d location(s), %d route(s) per location, up to %d search request(s), and up to %s configured search pacing before network and detail time", len(locations), len(discoveryOptions.Routes), estimate.Requests, estimate.Pacing)
+		} else {
+			progress.printf("planned %d location(s), up to %d search request(s), and up to %s configured location pacing before network and detail time", len(locations), estimate.Requests, estimate.Pacing)
 		}
 	}
 
@@ -342,6 +354,11 @@ func (searchCommand) Run(ctx Context, args []string) error {
 	var enricher *listingDetailEnricher
 	if detailOptions.needsEnrichment() {
 		enricher = newListingDetailEnricher(client, detailOptions.Workers, detailOptions.Delay, propertyResultCache)
+		if !locationSet {
+			enricher.setProgress(func(event detailProgress) {
+				progress.details("search", event)
+			})
+		}
 	}
 	today := time.Now()
 	applySortAndLimit := func(listings []zillow.Listing) []zillow.Listing {
@@ -357,27 +374,39 @@ func (searchCommand) Run(ctx Context, args []string) error {
 		}
 		return zillow.AnnotateListingHistory(listings, previousListings)
 	}
-	processListings := func(listings []zillow.Listing) []zillow.Listing {
-		listings = filterSnapshotListings(listings, filters)
+	filterBasicListings := func(listings []zillow.Listing) []zillow.Listing {
+		if discoveryRequested {
+			return filterDiscoveredListings(listings, filters)
+		}
+		return filterSnapshotListings(listings, filters)
+	}
+	processListings := func(listings []zillow.Listing, afterDetails func([]zillow.Listing) []zillow.Listing) []zillow.Listing {
+		listings = filterBasicListings(listings)
+		if discoveryRequested {
+			listings = filterListingsByDiscoveryBedRanges(listings, discoveryOptions.Routes, enricher != nil)
+		}
 		if enricher == nil {
-			return annotateHistory(applySortAndLimit(filterDetailedListings(listings, detailOptions, today)))
+			listings = finalizeEnrichedListings(requestContext, nil, listings, detailOptions, today, afterDetails)
+			return annotateHistory(applySortAndLimit(listings))
 		}
-		if !detailOptions.requiresAmenityDetails() {
-			listings = applySortAndLimit(listings)
-		} else {
-			listings = prefilterKnownListingMetadata(listings, detailOptions, today)
-		}
+		listings = prepareListingsForDetailEnrichment(listings, detailOptions, today, applySortAndLimit)
 		listings = enricher.Enrich(requestContext, listings)
-		if detailOptions.VerifyRecency {
-			listings = enricher.EnrichRecency(requestContext, listings)
+		listings = filterBasicListings(listings)
+		if discoveryRequested {
+			listings = filterListingsByDiscoveryBedRanges(listings, discoveryOptions.Routes, false)
 		}
-		listings = filterSnapshotListings(listings, filters)
-		listings = filterDetailedListings(listings, detailOptions, today)
+		listings = finalizeEnrichedListings(requestContext, enricher, listings, detailOptions, today, afterDetails)
 		return annotateHistory(applySortAndLimit(listings))
 	}
 
+	printer, err := output.NewPrinter(ctx.Stdout, ctx.OutputMode)
+	if err != nil {
+		return err
+	}
 	var result *zillow.SearchResult
 	var multiResult *multiLocationSearchResult
+	streamedMultiLocation := false
+	singleLocationPartialError := ""
 	switch {
 	case profileSet:
 		profile, loadErr := zillow.LoadSearchProfileFile(*profilePath)
@@ -389,7 +418,7 @@ func (searchCommand) Run(ctx Context, args []string) error {
 			IncludeRaw: *includeRaw,
 		})
 		if err == nil {
-			result.Listings = processListings(result.Listings)
+			result.Listings = processListings(result.Listings, nil)
 			result.Metadata.Returned = len(result.Listings)
 		}
 	case snapshotSet:
@@ -404,23 +433,41 @@ func (searchCommand) Run(ctx Context, args []string) error {
 		}
 		result, err = zillow.ReadSearchSnapshotWithOptions(reader, zillow.SearchSnapshotOptions{IncludeRaw: *includeRaw})
 		if err == nil {
-			result.Listings = processListings(result.Listings)
+			result.Listings = processListings(result.Listings, nil)
 			result.Metadata.Returned = len(result.Listings)
 		}
 	case locationSet:
 		areaResults := make([]locationSearchResult, 0, len(locations))
+		streamedMultiLocation = len(locations) > 1 && ctx.OutputMode == output.ModeJSONL
+		appendAreaResult := func(area locationSearchResult) error {
+			if streamedMultiLocation {
+				return printLocationResultJSONL(printer, area)
+			}
+			areaResults = append(areaResults, area)
+			return nil
+		}
 		liveLocationRequests := 0
-		for _, location := range locations {
+		for locationIndex, location := range locations {
+			locationStarted := time.Now()
+			locationLabel := fmt.Sprintf("location %d/%d %q", locationIndex+1, len(locations), location)
 			target, buildErr := locationSearchURL(location, *forRent)
 			if buildErr != nil {
 				if len(locations) == 1 {
 					return buildErr
 				}
-				areaResults = append(areaResults, locationSearchResult{Location: location, Error: buildErr.Error()})
+				progress.printf("%s: failed before request: %v", locationLabel, buildErr)
+				if err := appendAreaResult(locationSearchResult{Location: location, Error: buildErr.Error()}); err != nil {
+					return err
+				}
 				continue
 			}
 			locationDiscoveryOptions := applyLocationPageOverride(discoveryOptions, location, locationPageOverrides)
-			cacheKey := fmt.Sprintf("%s|raw=%t|discovery=%t|options=%v", target, *includeRaw, discoveryRequested, locationDiscoveryOptions)
+			locationDiscoveryOptions.Progress = func(event zillow.DiscoveryProgress) {
+				progress.discovery(locationLabel, event)
+			}
+			locationEstimate := estimateMultiLocationSearchPlan([]string{location}, discoveryRequested, locationDiscoveryOptions, nil, 0)
+			progress.printf("%s: starting (up to %d search request(s))", locationLabel, locationEstimate.Requests)
+			cacheKey := searchResultCacheKey(target, *includeRaw, discoveryRequested, locationDiscoveryOptions)
 			var areaResult *zillow.SearchResult
 			if searchResultCache != nil {
 				var cached zillow.SearchResult
@@ -428,18 +475,27 @@ func (searchCommand) Run(ctx Context, args []string) error {
 					_, _ = fmt.Fprintf(ctx.Stderr, "warning: location %q cache read failed: %v\n", location, cacheErr)
 				} else if hit {
 					areaResult = &cached
+					progress.printf("%s: search cache hit with %d candidate(s)", locationLabel, len(cached.Listings))
 				}
 			}
 			var fetchErr error
 			cacheableResult := true
+			partialError := ""
+			locationRetryOptions := wholeLocationRetryPolicy(discoveryRequested, retryOptions)
+			locationRetryOptions.OnRetry = func(attempt, maxAttempts int, delay time.Duration, retryErr error) {
+				progress.printf("%s: search retry %d/%d in %s after %v", locationLabel, attempt, maxAttempts, delay, retryErr)
+			}
 			if areaResult == nil {
 				if liveLocationRequests > 0 {
+					if *locationDelay > 0 {
+						progress.printf("%s: waiting %s between live locations", locationLabel, *locationDelay)
+					}
 					if sleepErr := sleepContext(requestContext, *locationDelay); sleepErr != nil {
 						return sleepErr
 					}
 				}
 				liveLocationRequests++
-				areaResult, fetchErr = fetchWithRetry(requestContext, retryOptions, func() (*zillow.SearchResult, error) {
+				areaResult, fetchErr = fetchWithRetry(requestContext, locationRetryOptions, func() (*zillow.SearchResult, error) {
 					if !discoveryRequested {
 						return client.FetchSearchPageWithOptions(requestContext, target, zillow.SearchPageOptions{IncludeRaw: *includeRaw})
 					}
@@ -449,6 +505,8 @@ func (searchCommand) Run(ctx Context, args []string) error {
 					}
 					if len(discovered.Issues) > 0 {
 						cacheableResult = false
+						first := discovered.Issues[0]
+						partialError = fmt.Sprintf("incomplete discovery: %d route page(s) failed; first failure on route %q page %d: %s", len(discovered.Issues), first.Route, first.Page, first.Error)
 					}
 					for _, issue := range discovered.Issues {
 						_, _ = fmt.Fprintf(ctx.Stderr, "warning: location %q route %q page %d failed: %s\n", location, issue.Route, issue.Page, issue.Error)
@@ -474,10 +532,18 @@ func (searchCommand) Run(ctx Context, args []string) error {
 					return fmt.Errorf("location %q: %w", location, explainZillowError(fetchErr))
 				}
 				message := fetchErr.Error()
-				_, _ = fmt.Fprintf(ctx.Stderr, "warning: location %q failed after %d attempt(s): %s\n", location, retryOptions.Retries+1, message)
-				areaResults = append(areaResults, locationSearchResult{Location: location, Error: message})
+				if discoveryRequested {
+					_, _ = fmt.Fprintf(ctx.Stderr, "warning: location %q failed: %s\n", location, message)
+				} else {
+					_, _ = fmt.Fprintf(ctx.Stderr, "warning: location %q failed after %d attempt(s): %s\n", location, locationRetryOptions.Retries+1, message)
+				}
+				progress.printf("%s: failed after %s: %s", locationLabel, time.Since(locationStarted).Round(time.Second), message)
+				if err := appendAreaResult(locationSearchResult{Location: location, Error: message}); err != nil {
+					return err
+				}
 				continue
 			}
+			progress.printf("%s: search returned %d candidate(s)", locationLabel, len(areaResult.Listings))
 			if *strictLocationBoundary || len(allowedCities) > 0 {
 				areaResult.Listings = filterListingsByLocationBoundary(areaResult.Listings, location, boundaryOptions, true)
 			} else if expectedState := locationStateQualifier(location); expectedState != "" {
@@ -488,25 +554,51 @@ func (searchCommand) Run(ctx Context, args []string) error {
 					if len(locations) == 1 {
 						return errors.New(message)
 					}
-					areaResults = append(areaResults, locationSearchResult{Location: location, Error: message})
+					progress.printf("%s: failed boundary validation: %s", locationLabel, message)
+					if err := appendAreaResult(locationSearchResult{Location: location, Error: message}); err != nil {
+						return err
+					}
 					continue
 				}
 			}
-			areaResult.Listings = processListings(areaResult.Listings)
-			if *strictLocationBoundary || len(allowedCities) > 0 {
-				areaResult.Listings = filterListingsByLocationBoundary(areaResult.Listings, location, boundaryOptions, false)
+			if enricher != nil {
+				// A retryable detail response stops the remainder of this
+				// location, but optional recency failures must not suppress
+				// required detail checks for later locations.
+				enricher.resetPause()
+				enricher.setProgress(func(event detailProgress) {
+					progress.details(locationLabel, event)
+				})
 			}
+			var afterDetails func([]zillow.Listing) []zillow.Listing
+			if *strictLocationBoundary || len(allowedCities) > 0 {
+				afterDetails = func(listings []zillow.Listing) []zillow.Listing {
+					return filterListingsByLocationBoundary(listings, location, boundaryOptions, false)
+				}
+			}
+			areaResult.Listings = processListings(areaResult.Listings, afterDetails)
 			areaResult.Metadata.Returned = len(areaResult.Listings)
-			areaResults = append(areaResults, locationSearchResult{
+			area := locationSearchResult{
 				Location: location,
 				Metadata: areaResult.Metadata,
 				Listings: areaResult.Listings,
 				Raw:      areaResult.Raw,
-			})
+				Error:    partialError,
+			}
+			if err := appendAreaResult(area); err != nil {
+				return err
+			}
+			if partialError != "" {
+				progress.printf("%s: completed incompletely with %d listing(s) in %s: %s", locationLabel, len(area.Listings), time.Since(locationStarted).Round(time.Second), partialError)
+			} else {
+				progress.printf("%s: completed with %d listing(s) in %s", locationLabel, len(area.Listings), time.Since(locationStarted).Round(time.Second))
+			}
 		}
+		progress.printf("completed %d location(s)", len(locations))
 		if len(locations) == 1 {
+			singleLocationPartialError = areaResults[0].Error
 			result = &zillow.SearchResult{Listings: areaResults[0].Listings, Metadata: areaResults[0].Metadata, Raw: areaResults[0].Raw}
-		} else {
+		} else if !streamedMultiLocation {
 			multiResult = &multiLocationSearchResult{Results: areaResults}
 		}
 	}
@@ -514,26 +606,36 @@ func (searchCommand) Run(ctx Context, args []string) error {
 		return explainZillowError(err)
 	}
 
-	printer, err := output.NewPrinter(ctx.Stdout, ctx.OutputMode)
-	if err != nil {
-		return err
+	if streamedMultiLocation {
+		return nil
 	}
 	if multiResult != nil {
 		return printMultiLocationResult(printer, ctx.OutputMode, *multiResult)
 	}
-	switch ctx.OutputMode {
+	return printSingleSearchResult(printer, ctx.OutputMode, result, singleLocationPartialError)
+}
+
+func printSingleSearchResult(printer *output.Printer, mode output.Mode, result *zillow.SearchResult, partialError string) error {
+	var printErr error
+	switch mode {
 	case output.ModeJSONL:
 		for _, listing := range result.Listings {
 			if err := printer.Print(listing); err != nil {
 				return err
 			}
 		}
-		return nil
 	case output.ModeTable:
-		return printer.Print(searchTable(result.Listings))
+		printErr = printer.Print(searchTable(result.Listings))
 	default:
-		return printer.Print(result)
+		printErr = printer.Print(result)
 	}
+	if printErr != nil {
+		return printErr
+	}
+	if partialError != "" {
+		return errors.New(partialError)
+	}
+	return nil
 }
 
 func writeSearchUsage(w interface{ Write([]byte) (int, error) }) {
@@ -596,7 +698,7 @@ Detail enrichment:
   --keyword-route <text>  Exact-2-bedroom keyword route; repeat as needed
   --home-type <value>      apartment, condo, townhouse, or single-family
   --location-max-pages <spec> Per-location cap as LOCATION=PAGES
-  --location-retries <n>   Retries after challenge/rate-limit responses (default 2)
+  --location-retries <n>   Retries per challenge/rate-limited request (default 2)
   --retry-backoff <d>      Initial retry cooldown, doubled per attempt (default 30s)
   --search-cache-ttl <d>   Reuse location results across commands (default 1h)
   --property-cache-ttl <d> Reuse property details across commands (default 6h)
@@ -610,6 +712,7 @@ Result controls:
   --timeout <duration>     HTTP timeout per request (default 20s)
   --raw                    Include raw search response JSON in JSON output
   --previous-results <path> Prior JSON/JSONL for new/changed/still-active labels
+  --progress               Write line-oriented progress updates to stderr
 `))
 }
 
@@ -641,16 +744,8 @@ func printMultiLocationResult(printer *output.Printer, mode output.Mode, result 
 	switch mode {
 	case output.ModeJSONL:
 		for _, area := range result.Results {
-			if area.Error != "" {
-				if err := printer.Print(locatedListing{Location: area.Location, Error: area.Error}); err != nil {
-					return err
-				}
-				continue
-			}
-			for index := range area.Listings {
-				if err := printer.Print(locatedListing{Location: area.Location, Listing: &area.Listings[index]}); err != nil {
-					return err
-				}
+			if err := printLocationResultJSONL(printer, area); err != nil {
+				return err
 			}
 		}
 		return nil
@@ -659,6 +754,18 @@ func printMultiLocationResult(printer *output.Printer, mode output.Mode, result 
 	default:
 		return printer.Print(result)
 	}
+}
+
+func printLocationResultJSONL(printer *output.Printer, area locationSearchResult) error {
+	for index := range area.Listings {
+		if err := printer.Print(locatedListing{Location: area.Location, Listing: &area.Listings[index]}); err != nil {
+			return err
+		}
+	}
+	if area.Error != "" {
+		return printer.Print(locatedListing{Location: area.Location, Error: area.Error})
+	}
+	return nil
 }
 
 type listingTableColumns struct {
@@ -687,7 +794,6 @@ func multiLocationTable(result multiLocationSearchResult) output.Table {
 			}
 			row = append(row, make([]string, len(listingHeaders))...)
 			rows = append(rows, row)
-			continue
 		}
 		for _, listing := range area.Listings {
 			row := []string{area.Location}
@@ -705,6 +811,21 @@ func multiLocationTable(result multiLocationSearchResult) output.Table {
 	headers = append(headers, listingHeaders...)
 	return output.Table{Headers: headers, Rows: rows}
 }
+
+type semanticDiscoveryCacheOptions struct {
+	Routes   []zillow.SearchRoute
+	MaxPages int
+}
+
+func searchResultCacheKey(target string, includeRaw, discovery bool, options zillow.DiscoveryOptions) string {
+	semantic := semanticDiscoveryCacheOptions{}
+	if discovery {
+		semantic.Routes = options.Routes
+		semantic.MaxPages = options.MaxPages
+	}
+	return fmt.Sprintf("%s|raw=%t|discovery=%t|options=%#v", target, includeRaw, discovery, semantic)
+}
+
 func locationSearchURL(location string, forRent bool) (string, error) {
 	slug := locationSlug(location)
 	if slug == "" {
@@ -790,6 +911,18 @@ func validateSnapshotFilters(filters zillow.SearchFilters) error {
 }
 
 func filterSnapshotListings(listings []zillow.Listing, filters zillow.SearchFilters) []zillow.Listing {
+	return filterListingsByBasicMetadata(listings, filters, false)
+}
+
+func filterDiscoveredListings(listings []zillow.Listing, filters zillow.SearchFilters) []zillow.Listing {
+	// Discovery routes already sent the requested home-type constraints to
+	// Zillow. Some valid list cards omit homeType until their property page is
+	// loaded, so retain unknown values for enrichment while still rejecting a
+	// known disallowed type.
+	return filterListingsByBasicMetadata(listings, filters, true)
+}
+
+func filterListingsByBasicMetadata(listings []zillow.Listing, filters zillow.SearchFilters, allowUnknownHomeType bool) []zillow.Listing {
 	filtered := make([]zillow.Listing, 0, len(listings))
 	for _, listing := range listings {
 		if filters.MinPrice > 0 {
@@ -813,8 +946,15 @@ func filterSnapshotListings(listings []zillow.Listing, filters zillow.SearchFilt
 				continue
 			}
 		}
-		if len(filters.HomeTypes) > 0 && !listingHomeTypeMatches(listing.HomeType, filters.HomeTypes) {
-			continue
+		if len(filters.HomeTypes) > 0 {
+			homeType := strings.TrimSpace(listing.HomeType)
+			if homeType == "" && allowUnknownHomeType {
+				filtered = append(filtered, listing)
+				continue
+			}
+			if !listingHomeTypeMatches(homeType, filters.HomeTypes) {
+				continue
+			}
 		}
 		filtered = append(filtered, listing)
 	}

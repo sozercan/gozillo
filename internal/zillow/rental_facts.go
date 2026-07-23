@@ -308,7 +308,7 @@ func rentalHistoryRecency(raw map[string]any, today time.Time) (string, string, 
 		}
 		event := canonicalText(firstString(entry, "event"))
 		rental, _ := boolFromAny(entry["postingIsRental"])
-		if !rental && !strings.Contains(event, "rent") {
+		if !rental && !strings.Contains(event, "rent") && !isRentalHistoryLifecycleReset(event) {
 			continue
 		}
 		events = append(events, rentalHistoryEvent{date: parsed, event: event, rental: rental})
@@ -321,7 +321,7 @@ func rentalHistoryRecency(raw map[string]any, today time.Time) (string, string, 
 	var updated time.Time
 	for _, event := range events {
 		switch {
-		case containsAny(event.event, "listing removed", "removed listing", "off market", "sold", "pending sale"):
+		case isRentalHistoryLifecycleReset(event.event):
 			listed = time.Time{}
 			updated = time.Time{}
 		case containsAny(event.event, "listed for rent", "listed for rental", "rental listing"):
@@ -344,6 +344,10 @@ func rentalHistoryRecency(raw map[string]any, today time.Time) (string, string, 
 		return listed.Format("2006-01-02"), updated.Format("2006-01-02"), nil
 	}
 	return listed.Format("2006-01-02"), updated.Format("2006-01-02"), &difference
+}
+
+func isRentalHistoryLifecycleReset(event string) bool {
+	return containsAny(event, "listing removed", "removed listing", "off market", "sold", "pending sale")
 }
 
 func parseRentalHistoryDate(value any) (time.Time, bool) {

@@ -52,7 +52,7 @@ type commandHelp struct {
 var plannedCommands = []commandHelp{
 	{name: "search", summary: "Search Zillow through pure Go HTTP or a saved snapshot"},
 	{name: "property", summary: "Extract normalized Zillow property details"},
-	{name: "har", summary: "Sanitize HARs and derive Zillow request profiles"},
+	{name: "har", summary: "Capture, sanitize, and derive Zillow HAR data"},
 	{name: "session", summary: "Import and manage file-backed Zillow sessions"},
 	{name: "version", summary: "Print the gozillo version"},
 }

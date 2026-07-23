@@ -47,7 +47,7 @@ func (options detailFilterOptions) needsEnrichment() bool {
 }
 
 func (options detailFilterOptions) requiresAmenityDetails() bool {
-	return options.Laundry != filterAny || options.Parking != filterAny || options.Pets != filterAny || len(options.Flex) > 0 || options.RequireForRent || options.ExcludeSharedHousing || options.ExcludeStudentHousing || options.ExcludeIncomeRestricted
+	return options.MaxTotalCost > 0 || options.Laundry != filterAny || options.Parking != filterAny || options.Pets != filterAny || len(options.Flex) > 0 || options.RequireForRent || options.ExcludeSharedHousing || options.ExcludeStudentHousing || options.ExcludeIncomeRestricted
 }
 
 func (options detailFilterOptions) hasAdvancedFilters() bool {
@@ -148,8 +148,37 @@ func oneOf(value string, choices ...string) bool {
 }
 
 type detailFetchResult struct {
-	page *zillow.RentalPage
-	err  error
+	page       *zillow.RentalPage
+	err        error
+	retryAfter time.Time
+}
+
+type detailProgressStage string
+
+const (
+	detailProgressEnrichment detailProgressStage = "property details"
+	detailProgressRecency    detailProgressStage = "recency details"
+)
+
+type detailProgressKind string
+
+const (
+	detailProgressStart  detailProgressKind = "start"
+	detailProgressItem   detailProgressKind = "item"
+	detailProgressPaused detailProgressKind = "paused"
+	detailProgressDone   detailProgressKind = "done"
+)
+
+type detailProgress struct {
+	Stage       detailProgressStage
+	Kind        detailProgressKind
+	Completed   int
+	Total       int
+	Cached      int
+	Fetched     int
+	Skipped     int
+	Err         error
+	PausedUntil time.Time
 }
 
 type propertyDiskRecord struct {
@@ -157,21 +186,40 @@ type propertyDiskRecord struct {
 	Property   *zillow.Property   `json:"property,omitempty"` // legacy cache compatibility
 	Error      string             `json:"error,omitempty"`
 	RetryAfter time.Time          `json:"retryAfter,omitempty"`
+	RetryKind  string             `json:"retryKind,omitempty"`
 }
+
+const (
+	propertyRetryKindChallenge = "challenge"
+	propertyRetryKindRateLimit = "rate-limit"
+)
+
+type cachedRetryableError struct {
+	message string
+	cause   error
+}
+
+func (err *cachedRetryableError) Error() string { return err.message }
+func (err *cachedRetryableError) Unwrap() error { return err.cause }
 
 type propertyFetcher interface {
 	FetchRentalPage(context.Context, string) (*zillow.RentalPage, error)
 }
 
 type listingDetailEnricher struct {
-	client    propertyFetcher
-	workers   int
-	delay     time.Duration
-	paceMu    sync.Mutex
-	nextStart time.Time
-	mu        sync.Mutex
-	cache     map[string]detailFetchResult
-	diskCache *diskCache
+	client     propertyFetcher
+	workers    int
+	delay      time.Duration
+	paceMu     sync.Mutex
+	nextStart  time.Time
+	paceNow    func() time.Time
+	paceWait   func(context.Context, time.Duration) error
+	mu         sync.Mutex
+	cache      map[string]detailFetchResult
+	blocked    detailFetchResult
+	diskCache  *diskCache
+	progressMu sync.RWMutex
+	progress   func(detailProgress)
 }
 
 func newListingDetailEnricher(client propertyFetcher, workers int, delay time.Duration, persistent *diskCache) *listingDetailEnricher {
@@ -184,6 +232,79 @@ func newListingDetailEnricher(client propertyFetcher, workers int, delay time.Du
 	}
 }
 
+func (enricher *listingDetailEnricher) setProgress(progress func(detailProgress)) {
+	if enricher == nil {
+		return
+	}
+	enricher.progressMu.Lock()
+	defer enricher.progressMu.Unlock()
+	enricher.progress = progress
+}
+
+func (enricher *listingDetailEnricher) reportProgress(progress detailProgress) {
+	if enricher == nil {
+		return
+	}
+	enricher.progressMu.RLock()
+	report := enricher.progress
+	enricher.progressMu.RUnlock()
+	if report != nil {
+		report(progress)
+	}
+}
+
+func (enricher *listingDetailEnricher) pauseAfterRetryable(result detailFetchResult) (detailFetchResult, bool) {
+	if enricher == nil || result.err == nil || result.retryAfter.IsZero() || !retryableZillowError(result.err) {
+		return detailFetchResult{}, false
+	}
+	enricher.mu.Lock()
+	defer enricher.mu.Unlock()
+	changed := enricher.blocked.err == nil || result.retryAfter.After(enricher.blocked.retryAfter)
+	if changed {
+		enricher.blocked = result
+	}
+	return enricher.blocked, changed
+}
+
+func (enricher *listingDetailEnricher) activePause() (detailFetchResult, bool) {
+	if enricher == nil {
+		return detailFetchResult{}, false
+	}
+	enricher.mu.Lock()
+	defer enricher.mu.Unlock()
+	if enricher.blocked.err == nil || enricher.blocked.retryAfter.IsZero() {
+		return detailFetchResult{}, false
+	}
+	if !enricher.blocked.retryAfter.After(enricher.now()) {
+		enricher.blocked = detailFetchResult{}
+		return detailFetchResult{}, false
+	}
+	return enricher.blocked, true
+}
+
+func (enricher *listingDetailEnricher) resetPause() {
+	if enricher == nil {
+		return
+	}
+	enricher.mu.Lock()
+	defer enricher.mu.Unlock()
+	enricher.blocked = detailFetchResult{}
+}
+
+func pausedDetailResult(block detailFetchResult) detailFetchResult {
+	if block.err == nil {
+		return block
+	}
+	message := "property detail requests paused after a retryable Zillow response"
+	if !block.retryAfter.IsZero() {
+		message = fmt.Sprintf("property detail requests paused until %s after a retryable Zillow response", block.retryAfter.Format(time.RFC3339))
+	}
+	return detailFetchResult{
+		err:        fmt.Errorf("%s: %w", message, block.err),
+		retryAfter: block.retryAfter,
+	}
+}
+
 func (enricher *listingDetailEnricher) Enrich(ctx context.Context, listings []zillow.Listing) []zillow.Listing {
 	if enricher == nil || enricher.client == nil || len(listings) == 0 {
 		return listings
@@ -191,6 +312,7 @@ func (enricher *listingDetailEnricher) Enrich(ctx context.Context, listings []zi
 
 	uniqueURLs := make([]string, 0, len(listings))
 	seen := make(map[string]struct{}, len(listings))
+	cachedCount := 0
 	for _, listing := range listings {
 		url := strings.TrimSpace(listing.URL)
 		if url == "" {
@@ -201,45 +323,120 @@ func (enricher *listingDetailEnricher) Enrich(ctx context.Context, listings []zi
 		}
 		seen[url] = struct{}{}
 		if _, cached := enricher.cached(url); cached {
+			cachedCount++
 			continue
 		}
 		if result, hit := enricher.loadPersistent(url); hit {
 			enricher.store(url, result)
+			cachedCount++
 			continue
 		}
 		uniqueURLs = append(uniqueURLs, url)
 	}
 
-	jobs := make(chan string)
-	var workers sync.WaitGroup
-	workerCount := enricher.workers
-	if workerCount < 1 {
-		workerCount = 1
+	total := len(uniqueURLs)
+	enricher.reportProgress(detailProgress{Stage: detailProgressEnrichment, Kind: detailProgressStart, Total: total, Cached: cachedCount})
+	fetched := 0
+	skipped := 0
+	completed := 0
+	pauseReported := false
+	var countMu sync.Mutex
+	record := func(wasFetched bool, result detailFetchResult) {
+		countMu.Lock()
+		completed++
+		if wasFetched {
+			fetched++
+		} else {
+			skipped++
+		}
+		progress := detailProgress{
+			Stage: detailProgressEnrichment, Kind: detailProgressItem,
+			Completed: completed, Total: total, Cached: cachedCount,
+			Fetched: fetched, Skipped: skipped, Err: result.err,
+		}
+		countMu.Unlock()
+		if wasFetched {
+			enricher.reportProgress(progress)
+		}
 	}
-	if workerCount > len(uniqueURLs) {
-		workerCount = len(uniqueURLs)
+	reportPause := func(block detailFetchResult) {
+		countMu.Lock()
+		if pauseReported {
+			countMu.Unlock()
+			return
+		}
+		pauseReported = true
+		progress := detailProgress{
+			Stage: detailProgressEnrichment, Kind: detailProgressPaused,
+			Completed: completed, Total: total, Cached: cachedCount,
+			Fetched: fetched, Skipped: skipped, Err: block.err, PausedUntil: block.retryAfter,
+		}
+		countMu.Unlock()
+		enricher.reportProgress(progress)
 	}
-	for range workerCount {
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
-			for url := range jobs {
-				if err := enricher.waitForTurn(ctx); err != nil {
-					enricher.store(url, detailFetchResult{err: err})
-					continue
+
+	if block, paused := enricher.activePause(); paused {
+		reportPause(block)
+		pausedResult := pausedDetailResult(block)
+		for _, url := range uniqueURLs {
+			enricher.store(url, pausedResult)
+			record(false, pausedResult)
+		}
+	} else if total > 0 {
+		jobs := make(chan string)
+		var workers sync.WaitGroup
+		workerCount := enricher.workers
+		if workerCount < 1 {
+			workerCount = 1
+		}
+		if workerCount > total {
+			workerCount = total
+		}
+		for range workerCount {
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				for url := range jobs {
+					if block, paused := enricher.activePause(); paused {
+						pausedResult := pausedDetailResult(block)
+						enricher.store(url, pausedResult)
+						record(false, pausedResult)
+						continue
+					}
+					if err := enricher.waitForTurn(ctx); err != nil {
+						result := detailFetchResult{err: err}
+						enricher.store(url, result)
+						record(true, result)
+						continue
+					}
+					if block, paused := enricher.activePause(); paused {
+						pausedResult := pausedDetailResult(block)
+						enricher.store(url, pausedResult)
+						record(false, pausedResult)
+						continue
+					}
+					page, err := enricher.client.FetchRentalPage(ctx, url)
+					result := enricher.newDetailFetchResult(page, err)
+					enricher.savePersistent(url, result)
+					enricher.store(url, result)
+					if block, changed := enricher.pauseAfterRetryable(result); changed {
+						reportPause(block)
+					}
+					record(true, result)
 				}
-				page, err := enricher.client.FetchRentalPage(ctx, url)
-				result := detailFetchResult{page: page, err: err}
-				enricher.savePersistent(url, result)
-				enricher.store(url, result)
-			}
-		}()
+			}()
+		}
+		for _, url := range uniqueURLs {
+			jobs <- url
+		}
+		close(jobs)
+		workers.Wait()
 	}
-	for _, url := range uniqueURLs {
-		jobs <- url
-	}
-	close(jobs)
-	workers.Wait()
+	enricher.reportProgress(detailProgress{
+		Stage: detailProgressEnrichment, Kind: detailProgressDone,
+		Completed: completed, Total: total, Cached: cachedCount,
+		Fetched: fetched, Skipped: skipped,
+	})
 
 	expanded := make([]zillow.Listing, 0, len(listings))
 	for index := range listings {
@@ -265,13 +462,18 @@ func (enricher *listingDetailEnricher) Enrich(ctx context.Context, listings []zi
 			expanded = append(expanded, listings[index])
 			continue
 		}
+		if result.page.Kind == zillow.RentalPageCommunity {
+			building := listings[index]
+			for propertyIndex := range result.page.Properties {
+				candidate := building
+				mergeCommunityPropertyDetails(&candidate, &result.page.Properties[propertyIndex])
+				expanded = append(expanded, candidate)
+			}
+			continue
+		}
 		for propertyIndex := range result.page.Properties {
 			if propertyIndex == 0 {
-				if result.page.Kind == zillow.RentalPageCommunity {
-					mergeCommunityPropertyDetails(&listings[index], &result.page.Properties[propertyIndex])
-				} else {
-					mergePropertyDetails(&listings[index], &result.page.Properties[propertyIndex])
-				}
+				mergePropertyDetails(&listings[index], &result.page.Properties[propertyIndex])
 				expanded = append(expanded, listings[index])
 				continue
 			}
@@ -299,7 +501,14 @@ func (enricher *listingDetailEnricher) loadPersistent(url string) (detailFetchRe
 		return detailFetchResult{page: &zillow.RentalPage{Kind: zillow.RentalPageProperty, Properties: []zillow.Property{*record.Property}}}, true
 	}
 	if record.Error != "" && record.RetryAfter.After(enricher.diskCache.now()) {
-		return detailFetchResult{err: errors.New(record.Error)}, true
+		cachedErr := error(errors.New(record.Error))
+		switch record.RetryKind {
+		case propertyRetryKindChallenge:
+			cachedErr = &cachedRetryableError{message: record.Error, cause: zillow.ErrChallenge}
+		case propertyRetryKindRateLimit:
+			cachedErr = &cachedRetryableError{message: record.Error, cause: zillow.ErrRateLimited}
+		}
+		return detailFetchResult{err: cachedErr, retryAfter: record.RetryAfter}, true
 	}
 	return detailFetchResult{}, false
 }
@@ -311,12 +520,17 @@ func (enricher *listingDetailEnricher) savePersistent(url string, result detailF
 	record := propertyDiskRecord{Page: result.page}
 	if result.err != nil {
 		switch {
+		case errors.Is(result.err, zillow.ErrChallenge):
+			record.Error = result.err.Error()
+			record.RetryAfter = result.retryAfter
+			record.RetryKind = propertyRetryKindChallenge
+		case errors.Is(result.err, zillow.ErrRateLimited):
+			record.Error = result.err.Error()
+			record.RetryAfter = result.retryAfter
+			record.RetryKind = propertyRetryKindRateLimit
 		case errors.Is(result.err, zillow.ErrSchemaDrift):
 			record.Error = result.err.Error()
-			record.RetryAfter = enricher.diskCache.now().Add(enricher.diskCache.TTL)
-		case retryableZillowError(result.err):
-			record.Error = result.err.Error()
-			record.RetryAfter = enricher.diskCache.now().Add(5 * time.Minute)
+			record.RetryAfter = result.retryAfter
 		default:
 			return
 		}
@@ -324,25 +538,66 @@ func (enricher *listingDetailEnricher) savePersistent(url string, result detailF
 	_ = enricher.diskCache.Save(url, record)
 }
 
+func (enricher *listingDetailEnricher) newDetailFetchResult(page *zillow.RentalPage, err error) detailFetchResult {
+	result := detailFetchResult{page: page, err: err}
+	if err == nil {
+		return result
+	}
+	now := enricher.now()
+	switch {
+	case errors.Is(err, zillow.ErrRateLimited):
+		cooldown := 5 * time.Minute
+		var rateLimit *zillow.RateLimitError
+		if errors.As(err, &rateLimit) && rateLimit.RetryAfter > 0 {
+			cooldown = rateLimit.RetryAfter
+		}
+		result.retryAfter = now.Add(cooldown)
+	case errors.Is(err, zillow.ErrChallenge):
+		result.retryAfter = now.Add(5 * time.Minute)
+	case errors.Is(err, zillow.ErrSchemaDrift) && enricher.diskCache != nil && enricher.diskCache.TTL > 0:
+		result.retryAfter = now.Add(enricher.diskCache.TTL)
+	}
+	return result
+}
+
+func (enricher *listingDetailEnricher) now() time.Time {
+	if enricher != nil && enricher.diskCache != nil {
+		return enricher.diskCache.now()
+	}
+	return time.Now()
+}
+
 func (enricher *listingDetailEnricher) waitForTurn(ctx context.Context) error {
 	if enricher.delay <= 0 {
 		return nil
 	}
+	now := time.Now
+	if enricher.paceNow != nil {
+		now = enricher.paceNow
+	}
+	wait := sleepContext
+	if enricher.paceWait != nil {
+		wait = enricher.paceWait
+	}
 	enricher.paceMu.Lock()
-	now := time.Now()
-	start := now
+	current := now()
+	start := current
 	if enricher.nextStart.After(start) {
 		start = enricher.nextStart
 	}
 	enricher.nextStart = start.Add(enricher.delay)
 	enricher.paceMu.Unlock()
-	return sleepContext(ctx, time.Until(start))
+	return wait(ctx, start.Sub(current))
 }
 
 func (enricher *listingDetailEnricher) cached(url string) (detailFetchResult, bool) {
 	enricher.mu.Lock()
 	defer enricher.mu.Unlock()
 	result, ok := enricher.cache[url]
+	if ok && result.err != nil && !result.retryAfter.IsZero() && !result.retryAfter.After(enricher.now()) {
+		delete(enricher.cache, url)
+		return detailFetchResult{}, false
+	}
 	return result, ok
 }
 
@@ -421,11 +676,13 @@ func mergeCommunityPropertyDetails(listing *zillow.Listing, property *zillow.Pro
 	if listing == nil || property == nil {
 		return
 	}
-	originalDays := listing.DaysOnZillow
+	listing.DaysOnZillow = nil
+	listing.ListedDate = ""
+	listing.UpdatedDate = ""
 	mergePropertyDetails(listing, property)
-	if property.ID != "" {
-		listing.ID = property.ID
-	}
+	// A community child without its own Zillow ID must not retain the parent
+	// building ID, which would make distinct units appear to be one listing.
+	listing.ID = property.ID
 	if property.URL != "" {
 		listing.URL = property.URL
 	}
@@ -453,18 +710,23 @@ func mergeCommunityPropertyDetails(listing *zillow.Listing, property *zillow.Pro
 	if property.Availability != "" {
 		listing.Availability = property.Availability
 	}
-	if listing.DaysOnZillow == nil {
-		listing.DaysOnZillow = originalDays
-	}
+	listing.IsBuilding = false
 }
 
 func prefilterKnownListingMetadata(listings []zillow.Listing, options detailFilterOptions, today time.Time) []zillow.Listing {
 	filtered := make([]zillow.Listing, 0, len(listings))
 	for _, listing := range listings {
+		// Building cards summarize multiple units. Their price, layout, recency,
+		// availability, and policy flags are not authoritative for every child,
+		// so defer detail filtering until after community expansion.
+		if listing.IsBuilding {
+			filtered = append(filtered, listing)
+			continue
+		}
 		if options.MinSqft > 0 && listing.LivingArea != nil && *listing.LivingArea < options.MinSqft {
 			continue
 		}
-		if options.MaxDaysOnZillow >= 0 && listing.DaysOnZillow != nil && *listing.DaysOnZillow > options.MaxDaysOnZillow {
+		if !options.VerifyRecency && options.MaxDaysOnZillow >= 0 && listing.DaysOnZillow != nil && *listing.DaysOnZillow > options.MaxDaysOnZillow {
 			continue
 		}
 		if options.AvailableFrom != nil || options.AvailableBy != nil {
@@ -497,7 +759,17 @@ func prefilterKnownListingMetadata(listings []zillow.Listing, options detailFilt
 	return filtered
 }
 
-func filterDetailedListings(listings []zillow.Listing, options detailFilterOptions, today time.Time) []zillow.Listing {
+func prepareListingsForDetailEnrichment(listings []zillow.Listing, options detailFilterOptions, today time.Time, applySortAndLimit func([]zillow.Listing) []zillow.Listing) []zillow.Listing {
+	if options.requiresAmenityDetails() {
+		return prefilterKnownListingMetadata(listings, options, today)
+	}
+	if options.VerifyRecency || applySortAndLimit == nil {
+		return listings
+	}
+	return applySortAndLimit(listings)
+}
+
+func filterDetailedListingsBeforeRecency(listings []zillow.Listing, options detailFilterOptions, today time.Time) []zillow.Listing {
 	if !options.hasAdvancedFilters() {
 		return listings
 	}
@@ -517,9 +789,6 @@ func filterDetailedListings(listings []zillow.Listing, options detailFilterOptio
 			continue
 		}
 		if options.MinSqft > 0 && (listing.LivingArea == nil || *listing.LivingArea < options.MinSqft) {
-			continue
-		}
-		if options.MaxDaysOnZillow >= 0 && (listing.DaysOnZillow == nil || *listing.DaysOnZillow > options.MaxDaysOnZillow) {
 			continue
 		}
 		if options.AvailableFrom != nil || options.AvailableBy != nil {
@@ -583,6 +852,39 @@ func filterDetailedListings(listings []zillow.Listing, options detailFilterOptio
 		filtered = append(filtered, listing)
 	}
 	return filtered
+}
+
+func filterListingsByRecency(listings []zillow.Listing, options detailFilterOptions) []zillow.Listing {
+	if options.MaxDaysOnZillow < 0 {
+		return listings
+	}
+	filtered := make([]zillow.Listing, 0, len(listings))
+	for _, listing := range listings {
+		if listing.DaysOnZillow == nil || *listing.DaysOnZillow > options.MaxDaysOnZillow {
+			continue
+		}
+		filtered = append(filtered, listing)
+	}
+	return filtered
+}
+
+func filterDetailedListings(listings []zillow.Listing, options detailFilterOptions, today time.Time) []zillow.Listing {
+	return filterListingsByRecency(filterDetailedListingsBeforeRecency(listings, options, today), options)
+}
+
+func enrichRecencyAfterDetailFilters(ctx context.Context, enricher *listingDetailEnricher, listings []zillow.Listing, options detailFilterOptions, today time.Time) []zillow.Listing {
+	listings = filterDetailedListingsBeforeRecency(listings, options, today)
+	if enricher != nil && options.VerifyRecency && len(listings) > 0 {
+		listings = enricher.EnrichRecency(ctx, listings)
+	}
+	return filterListingsByRecency(listings, options)
+}
+
+func finalizeEnrichedListings(ctx context.Context, enricher *listingDetailEnricher, listings []zillow.Listing, options detailFilterOptions, today time.Time, afterDetails func([]zillow.Listing) []zillow.Listing) []zillow.Listing {
+	if afterDetails != nil {
+		listings = afterDetails(listings)
+	}
+	return enrichRecencyAfterDetailFilters(ctx, enricher, listings, options, today)
 }
 
 func markListingWatchlist(listing *zillow.Listing, reason string) {
@@ -708,6 +1010,8 @@ func (enricher *listingDetailEnricher) EnrichRecency(ctx context.Context, listin
 		return listings
 	}
 	seen := make(map[string]struct{})
+	uniqueURLs := make([]string, 0, len(listings))
+	cachedCount := 0
 	for _, listing := range listings {
 		if listing.DaysOnZillow != nil || strings.TrimSpace(listing.URL) == "" {
 			continue
@@ -718,21 +1022,78 @@ func (enricher *listingDetailEnricher) EnrichRecency(ctx context.Context, listin
 		}
 		seen[url] = struct{}{}
 		if _, cached := enricher.cached(url); cached {
+			cachedCount++
 			continue
 		}
 		if result, hit := enricher.loadPersistent(url); hit {
 			enricher.store(url, result)
+			cachedCount++
+			continue
+		}
+		uniqueURLs = append(uniqueURLs, url)
+	}
+
+	total := len(uniqueURLs)
+	fetched := 0
+	skipped := 0
+	pauseReported := false
+	reportPause := func(completed int, block detailFetchResult) {
+		if pauseReported {
+			return
+		}
+		pauseReported = true
+		enricher.reportProgress(detailProgress{
+			Stage: detailProgressRecency, Kind: detailProgressPaused,
+			Completed: completed, Total: total, Cached: cachedCount,
+			Fetched: fetched, Skipped: skipped, Err: block.err, PausedUntil: block.retryAfter,
+		})
+	}
+	enricher.reportProgress(detailProgress{Stage: detailProgressRecency, Kind: detailProgressStart, Total: total, Cached: cachedCount})
+	for index, url := range uniqueURLs {
+		if block, paused := enricher.activePause(); paused {
+			reportPause(index, block)
+			pausedResult := pausedDetailResult(block)
+			enricher.store(url, pausedResult)
+			skipped++
 			continue
 		}
 		if err := enricher.waitForTurn(ctx); err != nil {
-			enricher.store(url, detailFetchResult{err: err})
+			result := detailFetchResult{err: err}
+			enricher.store(url, result)
+			fetched++
+			enricher.reportProgress(detailProgress{
+				Stage: detailProgressRecency, Kind: detailProgressItem,
+				Completed: index + 1, Total: total, Cached: cachedCount,
+				Fetched: fetched, Skipped: skipped, Err: result.err,
+			})
+			continue
+		}
+		if block, paused := enricher.activePause(); paused {
+			reportPause(index, block)
+			pausedResult := pausedDetailResult(block)
+			enricher.store(url, pausedResult)
+			skipped++
 			continue
 		}
 		page, err := enricher.client.FetchRentalPage(ctx, url)
-		result := detailFetchResult{page: page, err: err}
+		result := enricher.newDetailFetchResult(page, err)
 		enricher.savePersistent(url, result)
 		enricher.store(url, result)
+		fetched++
+		if block, changed := enricher.pauseAfterRetryable(result); changed {
+			reportPause(index+1, block)
+		}
+		enricher.reportProgress(detailProgress{
+			Stage: detailProgressRecency, Kind: detailProgressItem,
+			Completed: index + 1, Total: total, Cached: cachedCount,
+			Fetched: fetched, Skipped: skipped, Err: result.err,
+		})
 	}
+	enricher.reportProgress(detailProgress{
+		Stage: detailProgressRecency, Kind: detailProgressDone,
+		Completed: total, Total: total, Cached: cachedCount,
+		Fetched: fetched, Skipped: skipped,
+	})
 
 	for index := range listings {
 		if listings[index].DaysOnZillow != nil {

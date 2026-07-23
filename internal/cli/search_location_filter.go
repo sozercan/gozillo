@@ -77,6 +77,10 @@ func filterListingsByLocationBoundary(listings []zillow.Listing, query string, o
 				continue
 			}
 		}
+		actualState := strings.TrimSpace(listing.Address.State)
+		if queryState != "" && !(allowUnknown && actualState == "") && !strings.EqualFold(actualState, queryState) {
+			continue
+		}
 		if options.Strict {
 			switch {
 			case isZIP:
@@ -89,10 +93,6 @@ func filterListingsByLocationBoundary(listings []zillow.Listing, query string, o
 					if _, matches := expectedCities[city]; !matches {
 						continue
 					}
-				}
-				actualState := strings.TrimSpace(listing.Address.State)
-				if queryState != "" && !(allowUnknown && actualState == "") && !strings.EqualFold(actualState, queryState) {
-					continue
 				}
 			}
 		}

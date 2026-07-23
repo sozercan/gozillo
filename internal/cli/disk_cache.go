@@ -36,7 +36,11 @@ func defaultDiskCache(namespace string, ttl time.Duration) (*diskCache, error) {
 	if strings.TrimSpace(namespace) == "" || strings.ContainsAny(namespace, `/\\`) {
 		return nil, errors.New("cache namespace is invalid")
 	}
-	base := strings.TrimSpace(os.Getenv("GOZILLO_CONFIG_DIR"))
+	base := strings.TrimSpace(os.Getenv("GOZILLO_CACHE_DIR"))
+	if base != "" {
+		return &diskCache{Dir: filepath.Join(base, namespace), TTL: ttl, Now: time.Now}, nil
+	}
+	base = strings.TrimSpace(os.Getenv("GOZILLO_CONFIG_DIR"))
 	if base == "" {
 		var err error
 		base, err = os.UserConfigDir()

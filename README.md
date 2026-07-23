@@ -44,6 +44,100 @@ go build -o gozillo ./cmd/gozillo
 
 ### 1. Capture a non-sanitized HAR in Edge or Chrome
 
+#### Automatic capture through CDP
+
+The quickest way to start a dedicated Edge instance is:
+
+```bash
+make edge-cdp
+# or: ./scripts/open-edge-cdp.sh
+```
+
+Override the defaults with `GOZILLO_CDP_PORT` or
+`GOZILLO_CDP_PROFILE_DIR` when needed.
+
+Start a separate Chrome or Edge instance with a remote-debugging port and a
+**dedicated, non-default** user data directory. Remote debugging grants control
+of that browser instance, so keep the endpoint on loopback and do not expose
+port `9222` to another machine. Non-loopback endpoints are rejected unless
+`--allow-remote-cdp` is supplied explicitly. Remote capture requires an exact
+`ws://` or `wss://` browser WebSocket URL; HTTP discovery remains loopback-only.
+
+macOS examples:
+
+```bash
+# Chrome
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  --remote-debugging-port=9222 \
+  --remote-debugging-address=127.0.0.1 \
+  --user-data-dir="$HOME/.gozillo/chrome-cdp"
+
+# Edge
+"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge" \
+  --remote-debugging-port=9222 \
+  --remote-debugging-address=127.0.0.1 \
+  --user-data-dir="$HOME/.gozillo/edge-cdp"
+```
+
+Linux examples; adjust the executable name for your installation:
+
+```bash
+# Chrome
+google-chrome \
+  --remote-debugging-port=9222 \
+  --remote-debugging-address=127.0.0.1 \
+  --user-data-dir="$HOME/.gozillo/chrome-cdp"
+
+# Edge
+microsoft-edge \
+  --remote-debugging-port=9222 \
+  --remote-debugging-address=127.0.0.1 \
+  --user-data-dir="$HOME/.gozillo/edge-cdp"
+```
+
+Use that dedicated browser normally to establish only the session state you are
+authorized to use. Then capture one new navigation:
+
+```bash
+HAR="$HOME/Downloads/zillow.raw.har"
+
+gozillo har capture \
+  --cdp http://127.0.0.1:9222 \
+  --out "$HAR" \
+  'https://www.zillow.com/'
+```
+
+The general form is
+`gozillo har capture --cdp http://127.0.0.1:9222 --out <path> <https-url>`.
+The command opens a new tab, starts CDP network recording, and only then
+navigates to the supplied URL. CDP cannot recover requests that occurred before
+recording began, so this does not capture an already-loaded tab's past traffic.
+
+Capture controls:
+
+- `--wait <duration>` keeps recording after page load (default `5s`) for
+  follow-up requests.
+- `--timeout <duration>` bounds connection, navigation, and capture time
+  (default `45s`) and must be longer than `--wait`.
+- `--response-bodies` attempts to save response bodies. It is off by default
+  because bodies can make the HAR much larger and can contain additional
+  sensitive data. CDP cannot reliably return redirect-hop bodies after request
+  IDs are reused, so those entries are marked as incomplete.
+- Capture retention is bounded to 10,000 entries and 128 MiB of retained event
+  data; the command fails instead of writing a partial HAR if either limit is
+  exceeded.
+
+The recorder targets the primary page session, which contains the first-party
+navigation and fetch/XHR traffic used by `gozillo`. Requests emitted only from
+child CDP targets, such as dedicated workers or out-of-process iframes, may be
+omitted; the HAR log includes this limitation in its comment metadata.
+
+`gozillo` writes the raw HAR atomically with owner-only mode `0600` on supported
+systems. Owner-only HAR writes are currently unsupported on Windows; use the
+manual export flow below there and protect the resulting file appropriately.
+
+#### Manual DevTools export
+
 Edge and Chrome omit cookies and authorization data from sanitized HAR
 exports. A session import needs the **non-sanitized** export:
 
@@ -71,7 +165,9 @@ chmod 600 "$HAR"
 ```
 
 A non-sanitized HAR is a plaintext secret. Never commit, upload, paste, or share
-it. Delete it when it is no longer needed.
+it. Delete it when it is no longer needed. CDP capture is a recording mechanism,
+not a way to bypass authentication, rate limits, bot protections, or other
+access controls.
 
 ### 2. Import the session
 
@@ -244,7 +340,21 @@ gozillo --output=jsonl search \
 Laundry, total-cost, rental-status, parking, pet, and flex filters automatically
 fetch Zillow detail pages. Apartment-community pages can produce multiple unit
 or floor-plan results. Use `--page-delay`, `--detail-delay`, and
-`--location-delay` to reduce request frequency for larger searches.
+`--location-delay` to reduce request frequency for larger searches. Add
+`--progress` for line-oriented location, route/page, retry, and detail progress
+on stderr; stdout remains machine-readable. Multi-location JSONL is flushed as
+each location completes. After a challenge or rate limit, queued property-detail
+requests for that location are skipped instead of continuing through the whole
+batch; later locations start with a fresh detail circuit.
+
+When `--verify-recency` is enabled, post-expansion location checks and all
+recency-independent detail filters run first. Unit-page recency requests are
+therefore limited to listings that can still survive the final result set;
+`--max-days-on-zillow` and `--sort-by newest` still use the verified values.
+
+Set `GOZILLO_CACHE_DIR` to keep search and property caches separate from
+`GOZILLO_CONFIG_DIR`. This is useful when sessions remain isolated per run but
+cache entries should be reused across runs for their configured TTL.
 
 ### Proxy
 
@@ -318,7 +428,7 @@ value `Unknown`, explain the evidence gap, and record the last-checked date.
 | `search` | Search locations, profiles, or saved snapshots |
 | `property` | Read normalized property details |
 | `session` | Import, inspect, list, and remove sessions |
-| `har` | Sanitize HARs and derive direct-search profiles |
+| `har` | Capture HARs through CDP, sanitize them, and derive direct-search profiles |
 | `version` | Print the CLI version |
 
 Run `gozillo <command> --help` for the full option list.
@@ -357,7 +467,8 @@ many separate commands.
 The default location search remains one rendered page. For deeper coverage,
 use bounded `--bed-range`, `--server-sort`, `--max-pages`, and `--home-type`
 routes. `--supplemental-no-laundry` covers amenity-index misses, and
-`--keyword-route` adds focused flex searches. Review stderr coverage warnings
+`--keyword-route` adds focused flex searches. Bounded location retries also
+apply to challenged or rate-limited route pages. Review stderr coverage warnings
 when a route has more reported pages than the configured cap. Zillow can still omit or change private website data.
 
 ## Development

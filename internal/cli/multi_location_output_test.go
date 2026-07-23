@@ -45,6 +45,81 @@ func TestMultiLocationJSONLPreservesSuccessfulListingsAndErrors(t *testing.T) {
 	}
 }
 
+func TestPrintLocationResultJSONLWritesEachCompletedAreaImmediately(t *testing.T) {
+	t.Parallel()
+
+	var buffer bytes.Buffer
+	printer, err := output.NewPrinter(&buffer, output.ModeJSONL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := printLocationResultJSONL(printer, locationSearchResult{
+		Location: "94501",
+		Listings: []zillow.Listing{{ID: "first"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buffer.String(), `"location":"94501"`) || !strings.Contains(buffer.String(), `"id":"first"`) {
+		t.Fatalf("first streamed area = %q", buffer.String())
+	}
+	firstSize := buffer.Len()
+	if err := printLocationResultJSONL(printer, locationSearchResult{Location: "94703", Error: "challenge"}); err != nil {
+		t.Fatal(err)
+	}
+	if buffer.Len() <= firstSize || !strings.Contains(buffer.String()[firstSize:], `"location":"94703"`) {
+		t.Fatalf("second streamed area = %q", buffer.String()[firstSize:])
+	}
+}
+
+func TestPartialLocationJSONLIncludesListingsAndIncompleteError(t *testing.T) {
+	t.Parallel()
+
+	var buffer bytes.Buffer
+	printer, err := output.NewPrinter(&buffer, output.ModeJSONL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := printLocationResultJSONL(printer, locationSearchResult{
+		Location: "94501",
+		Listings: []zillow.Listing{{ID: "partial"}},
+		Error:    "incomplete discovery",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(buffer.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("lines = %q, want listing plus error", lines)
+	}
+	var listingRecord, errorRecord locatedListing
+	if err := json.Unmarshal([]byte(lines[0]), &listingRecord); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(lines[1]), &errorRecord); err != nil {
+		t.Fatal(err)
+	}
+	if listingRecord.Listing == nil || listingRecord.Listing.ID != "partial" || errorRecord.Error != "incomplete discovery" {
+		t.Fatalf("records = (%+v, %+v)", listingRecord, errorRecord)
+	}
+}
+
+func TestSingleLocationJSONLReturnsIncompleteErrorAfterWritingListings(t *testing.T) {
+	t.Parallel()
+
+	var buffer bytes.Buffer
+	printer, err := output.NewPrinter(&buffer, output.ModeJSONL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := &zillow.SearchResult{Listings: []zillow.Listing{{ID: "partial"}}}
+	err = printSingleSearchResult(printer, output.ModeJSONL, result, "incomplete discovery")
+	if err == nil || err.Error() != "incomplete discovery" {
+		t.Fatalf("error = %v", err)
+	}
+	if !strings.Contains(buffer.String(), `"id":"partial"`) {
+		t.Fatalf("JSONL output = %q", buffer.String())
+	}
+}
+
 func TestMultiLocationTableIncludesErrorRows(t *testing.T) {
 	t.Parallel()
 
@@ -56,6 +131,22 @@ func TestMultiLocationTableIncludesErrorRows(t *testing.T) {
 		t.Fatalf("headers = %#v", table.Headers)
 	}
 	if len(table.Rows) != 2 || table.Rows[1][0] != "94703" || table.Rows[1][1] != "challenge response" {
+		t.Fatalf("rows = %#v", table.Rows)
+	}
+}
+
+func TestMultiLocationTableKeepsPartialListingsBesideError(t *testing.T) {
+	t.Parallel()
+
+	table := multiLocationTable(multiLocationSearchResult{Results: []locationSearchResult{{
+		Location: "94501",
+		Listings: []zillow.Listing{{ID: "partial"}},
+		Error:    "incomplete discovery",
+	}}})
+	if len(table.Rows) != 2 {
+		t.Fatalf("rows = %#v, want error row and listing row", table.Rows)
+	}
+	if table.Rows[0][1] != "incomplete discovery" || table.Rows[1][0] != "94501" || table.Rows[1][2] != "partial" {
 		t.Fatalf("rows = %#v", table.Rows)
 	}
 }

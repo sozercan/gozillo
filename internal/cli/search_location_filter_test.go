@@ -51,3 +51,31 @@ func TestLocationBoundaryDefersUnknownSearchCardUntilAfterEnrichment(t *testing.
 		t.Fatalf("unknown final result survived strict boundary: %+v", got)
 	}
 }
+
+func TestAllowedCityPreservesQueryStateConstraint(t *testing.T) {
+	t.Parallel()
+
+	options := locationBoundaryOptions{AllowedCities: map[string]struct{}{"springfield": {}}}
+	listings := []zillow.Listing{
+		{ID: "right", Address: zillow.Address{City: "Springfield", State: "CA"}},
+		{ID: "wrong", Address: zillow.Address{City: "Springfield", State: "MA"}},
+	}
+
+	got := filterListingsByLocationBoundary(listings, "Springfield CA", options, false)
+	if ids := listingIDs(got); !reflect.DeepEqual(ids, []string{"right"}) {
+		t.Fatalf("filtered IDs = %v", ids)
+	}
+}
+
+func TestAllowedCityDefersUnknownStateUntilAfterEnrichment(t *testing.T) {
+	t.Parallel()
+
+	options := locationBoundaryOptions{AllowedCities: map[string]struct{}{"springfield": {}}}
+	listing := zillow.Listing{ID: "pending", Address: zillow.Address{City: "Springfield"}}
+	if got := filterListingsByLocationBoundary([]zillow.Listing{listing}, "Springfield CA", options, true); len(got) != 1 {
+		t.Fatalf("unknown state was removed before enrichment: %+v", got)
+	}
+	if got := filterListingsByLocationBoundary([]zillow.Listing{listing}, "Springfield CA", options, false); len(got) != 0 {
+		t.Fatalf("unknown final state survived filtering: %+v", got)
+	}
+}

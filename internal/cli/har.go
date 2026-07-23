@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"gozillo/internal/cdphar"
 	"gozillo/internal/har"
 	"gozillo/internal/output"
 )
@@ -17,7 +19,7 @@ import (
 type harCommand struct{}
 
 func (harCommand) Name() string    { return "har" }
-func (harCommand) Summary() string { return "Sanitize HARs and derive Zillow request profiles" }
+func (harCommand) Summary() string { return "Capture, sanitize, and derive Zillow HAR data" }
 
 func (harCommand) Run(ctx Context, args []string) error {
 	if len(args) == 0 || wantsHelp(args) {
@@ -26,6 +28,8 @@ func (harCommand) Run(ctx Context, args []string) error {
 	}
 
 	switch args[0] {
+	case "capture":
+		return runHARCapture(ctx, args[1:])
 	case "sanitize":
 		return runHARSanitize(ctx, args[1:])
 	case "candidates":
@@ -35,6 +39,60 @@ func (harCommand) Run(ctx Context, args []string) error {
 	default:
 		return usagef("unknown har subcommand %q", args[0])
 	}
+}
+
+func runHARCapture(ctx Context, args []string) error {
+	flags := flag.NewFlagSet("har capture", flag.ContinueOnError)
+	flags.SetOutput(ctx.Stderr)
+	endpoint := flags.String("cdp", cdphar.DefaultEndpoint, "Chrome DevTools Protocol endpoint")
+	outPath := flags.String("out", "", "output raw HAR path")
+	wait := flags.Duration("wait", cdphar.DefaultWait, "time to keep recording after page load")
+	timeout := flags.Duration("timeout", cdphar.DefaultTimeout, "maximum time for connection, navigation, and capture")
+	responseBodies := flags.Bool("response-bodies", false, "attempt to include response bodies (can be large and sensitive)")
+	allowRemote := flags.Bool("allow-remote-cdp", false, "allow a non-loopback CDP endpoint")
+	if err := flags.Parse(args); err != nil {
+		return &usageError{err: err}
+	}
+	if flags.NArg() != 1 {
+		return usagef("har capture requires exactly one http(s) URL")
+	}
+	if strings.TrimSpace(*outPath) == "" {
+		return usagef("har capture requires --out")
+	}
+	if *outPath == "-" {
+		return usagef("har capture requires a file path; raw HAR output to stdout is disabled")
+	}
+	if *wait < 0 {
+		return usagef("har capture --wait must be non-negative")
+	}
+	if *timeout <= 0 {
+		return usagef("har capture --timeout must be positive")
+	}
+	if *wait >= *timeout {
+		return usagef("har capture --wait must be shorter than --timeout")
+	}
+	if runtime.GOOS == "windows" {
+		return fmt.Errorf("har capture: owner-only raw HAR writes are unsupported on Windows")
+	}
+
+	archive, err := cdphar.Capture(context.Background(), cdphar.Options{
+		Endpoint:              *endpoint,
+		URL:                   flags.Arg(0),
+		Wait:                  *wait,
+		Timeout:               *timeout,
+		IncludeResponseBodies: *responseBodies,
+		AllowRemoteEndpoint:   *allowRemote,
+		CreatorName:           Name,
+		CreatorVersion:        Version,
+	})
+	if err != nil {
+		return err
+	}
+	if err := har.SaveFile(*outPath, archive); err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(ctx.Stdout, "captured %d HAR entries -> %s\n", len(archive.Log.Entries), *outPath)
+	return err
 }
 
 func runHARSanitize(ctx Context, args []string) error {
@@ -161,13 +219,29 @@ func runHARDerive(ctx Context, args []string) error {
 func writeHARUsage(w io.Writer) {
 	_, _ = io.WriteString(w, `Usage:
   gozillo [global options] har <subcommand> [options]
+  gozillo har capture [capture options] --out <raw.har> <http(s)-url>
+
+Capture options:
+  --cdp <endpoint>       CDP HTTP endpoint or exact browser WebSocket URL
+                         (default: http://127.0.0.1:9222)
+  --out <path>           Required raw HAR output path
+  --wait <duration>      Keep recording after page load (default: 5s)
+  --timeout <duration>   Bound connection, navigation, and capture (default: 45s)
+  --response-bodies      Attempt to include response bodies (best effort)
+  --allow-remote-cdp     Permit a non-loopback exact WebSocket URL (high trust)
+
+Raw captures can contain cookies and credential headers. They are written only
+to an owner-only file and are never emitted on stdout. Capture covers the
+primary page target; child worker/OOPIF target traffic may be omitted.
 
 Subcommands:
+  capture     Open a new browser tab through CDP and save a raw HAR
   sanitize    Remove cookies, credential headers, sensitive values, and response bodies
   candidates  Rank likely Zillow data requests
   derive      Derive a reusable search profile
 
 Examples:
+  gozillo har capture --cdp http://127.0.0.1:9222 --out search.raw.har https://www.zillow.com/
   gozillo har sanitize --out search.sanitized.har search.raw.har
   gozillo har candidates search.sanitized.har
   gozillo har derive --out search.profile.json search.sanitized.har

@@ -20,9 +20,38 @@ type SearchRoute struct {
 
 // DiscoveryOptions controls bounded, paginated discovery for one location.
 type DiscoveryOptions struct {
-	Routes    []SearchRoute
-	MaxPages  int
-	PageDelay time.Duration
+	Routes         []SearchRoute
+	MaxPages       int
+	PageDelay      time.Duration
+	RequestRetries int
+	RetryBackoff   time.Duration
+	Progress       func(DiscoveryProgress)
+}
+
+// DiscoveryProgressStage identifies the request currently being attempted or
+// retried during one location discovery.
+type DiscoveryProgressStage string
+
+const (
+	DiscoveryProgressBootstrap DiscoveryProgressStage = "bootstrap"
+	DiscoveryProgressPage      DiscoveryProgressStage = "page"
+	DiscoveryProgressRetry     DiscoveryProgressStage = "retry"
+)
+
+// DiscoveryProgress reports line-oriented progress without coupling the
+// library to a particular logger or output format. Attempt, route, and page
+// indexes are one-based when present.
+type DiscoveryProgress struct {
+	Stage       DiscoveryProgressStage
+	Route       string
+	RouteIndex  int
+	RouteCount  int
+	Page        int
+	PageLimit   int
+	Attempt     int
+	MaxAttempts int
+	Delay       time.Duration
+	Err         error
 }
 
 // DiscoveryIssue records one failed route page while retaining other results.
@@ -62,7 +91,20 @@ func (c *Client) DiscoverLocation(ctx context.Context, rawURL string, options Di
 	if err != nil {
 		return nil, fmt.Errorf("discover Zillow location: %w", err)
 	}
-	profile, err := c.fetchSearchProfile(ctx, rawURL)
+	reportDiscoveryProgress(options, DiscoveryProgress{
+		Stage:       DiscoveryProgressBootstrap,
+		Attempt:     1,
+		MaxAttempts: options.RequestRetries + 1,
+	})
+	profile, err := c.fetchSearchProfileWithRetry(ctx, rawURL, options.RequestRetries, options.RetryBackoff, func(attempt int, delay time.Duration, retryErr error) {
+		reportDiscoveryProgress(options, DiscoveryProgress{
+			Stage:       DiscoveryProgressRetry,
+			Attempt:     attempt,
+			MaxAttempts: options.RequestRetries + 1,
+			Delay:       delay,
+			Err:         retryErr,
+		})
+	})
 	if err != nil {
 		return nil, fmt.Errorf("discover Zillow location: %w", err)
 	}
@@ -73,25 +115,55 @@ func (c *Client) DiscoverLocation(ctx context.Context, rawURL string, options Di
 	}
 	seen := make(map[string]struct{})
 	requestCount := 0
-	for _, route := range routes {
+	for routeIndex, route := range routes {
 		coverage := SearchCoverage{Route: route.Name}
+		stopAfterRoute := false
 		routeSeen := make(map[string]struct{})
 		routeMaxPages := maxPages
 		if route.MaxPages > 0 {
 			routeMaxPages = route.MaxPages
 		}
 		for page := 1; page <= routeMaxPages; page++ {
+			pageDelay := time.Duration(0)
 			if requestCount > 0 && options.PageDelay > 0 {
-				if err := waitDiscoveryDelay(ctx, options.PageDelay); err != nil {
+				pageDelay = options.PageDelay
+			}
+			reportDiscoveryProgress(options, DiscoveryProgress{
+				Stage:       DiscoveryProgressPage,
+				Route:       route.Name,
+				RouteIndex:  routeIndex + 1,
+				RouteCount:  len(routes),
+				Page:        page,
+				PageLimit:   routeMaxPages,
+				Attempt:     1,
+				MaxAttempts: options.RequestRetries + 1,
+				Delay:       pageDelay,
+			})
+			if pageDelay > 0 {
+				if err := waitDiscoveryDelay(ctx, pageDelay); err != nil {
 					return nil, fmt.Errorf("discover Zillow location: %w", err)
 				}
 			}
 			requestCount++
 			filters := route.Filters
 			filters.Page = page
-			pageResult, searchErr := c.SearchWithOptions(ctx, profile, SearchOptions{Filters: filters})
+			pageResult, searchErr := c.searchDiscoveryPageWithRetry(ctx, profile, filters, options.RequestRetries, options.RetryBackoff, func(attempt int, delay time.Duration, retryErr error) {
+				reportDiscoveryProgress(options, DiscoveryProgress{
+					Stage:       DiscoveryProgressRetry,
+					Route:       route.Name,
+					RouteIndex:  routeIndex + 1,
+					RouteCount:  len(routes),
+					Page:        page,
+					PageLimit:   routeMaxPages,
+					Attempt:     attempt,
+					MaxAttempts: options.RequestRetries + 1,
+					Delay:       delay,
+					Err:         retryErr,
+				})
+			})
 			if searchErr != nil {
 				result.Issues = append(result.Issues, DiscoveryIssue{Route: route.Name, Page: page, Error: searchErr.Error()})
+				stopAfterRoute = discoveryRequestRetryable(searchErr)
 				break
 			}
 			coverage.PagesFetched++
@@ -118,12 +190,15 @@ func (c *Client) DiscoverLocation(ctx context.Context, rawURL string, options Di
 				coverage.Complete = true
 				break
 			}
-			if len(pageResult.Listings) == 0 || newOnPage == 0 {
+			if len(pageResult.Listings) == 0 || (newOnPage == 0 && pageResult.Metadata.TotalPages <= 0) {
 				coverage.Complete = true
 				break
 			}
 		}
 		result.Coverage = append(result.Coverage, coverage)
+		if stopAfterRoute {
+			break
+		}
 	}
 	return result, nil
 }
@@ -191,6 +266,12 @@ func validateDiscoveryOptions(options DiscoveryOptions) (int, []SearchRoute, err
 	if options.PageDelay < 0 {
 		return 0, nil, errors.New("page delay must not be negative")
 	}
+	if options.RequestRetries < 0 {
+		return 0, nil, errors.New("request retries must not be negative")
+	}
+	if options.RetryBackoff < 0 {
+		return 0, nil, errors.New("retry backoff must not be negative")
+	}
 	routes := options.Routes
 	if len(routes) == 0 {
 		routes = []SearchRoute{{Name: "default"}}
@@ -216,6 +297,71 @@ func validateDiscoveryOptions(options DiscoveryOptions) (int, []SearchRoute, err
 		}
 	}
 	return maxPages, append([]SearchRoute(nil), routes...), nil
+}
+
+func (c *Client) fetchSearchProfileWithRetry(ctx context.Context, rawURL string, retries int, backoff time.Duration, onRetry func(int, time.Duration, error)) (*SearchProfile, error) {
+	return retryDiscoveryRequest(ctx, retries, backoff, onRetry, func() (*SearchProfile, error) {
+		return c.fetchSearchProfile(ctx, rawURL)
+	})
+}
+
+func (c *Client) searchDiscoveryPageWithRetry(ctx context.Context, profile *SearchProfile, filters SearchFilters, retries int, backoff time.Duration, onRetry func(int, time.Duration, error)) (*SearchResult, error) {
+	return retryDiscoveryRequest(ctx, retries, backoff, onRetry, func() (*SearchResult, error) {
+		return c.SearchWithOptions(ctx, profile, SearchOptions{Filters: filters})
+	})
+}
+
+func retryDiscoveryRequest[T any](ctx context.Context, retries int, backoff time.Duration, onRetry func(int, time.Duration, error), request func() (T, error)) (T, error) {
+	var zero T
+	for attempt := 0; ; attempt++ {
+		result, err := request()
+		if err == nil {
+			return result, nil
+		}
+		if attempt >= retries || !discoveryRequestRetryable(err) {
+			return zero, err
+		}
+		delay := discoveryRetryBackoff(backoff, attempt)
+		var rateLimit *RateLimitError
+		if errors.As(err, &rateLimit) && rateLimit.RetryAfter > delay {
+			delay = rateLimit.RetryAfter
+		}
+		if onRetry != nil {
+			onRetry(attempt+2, delay, err)
+		}
+		if delay > 0 {
+			if err := waitDiscoveryDelay(ctx, delay); err != nil {
+				return zero, err
+			}
+		}
+	}
+}
+
+func reportDiscoveryProgress(options DiscoveryOptions, progress DiscoveryProgress) {
+	if options.Progress != nil {
+		options.Progress(progress)
+	}
+}
+
+func discoveryRequestRetryable(err error) bool {
+	return errors.Is(err, ErrChallenge) || errors.Is(err, ErrRateLimited)
+}
+
+func discoveryRetryBackoff(base time.Duration, attempt int) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	delay := base
+	for range attempt {
+		if delay >= 5*time.Minute/2 {
+			return 5 * time.Minute
+		}
+		delay *= 2
+	}
+	if delay > 5*time.Minute {
+		return 5 * time.Minute
+	}
+	return delay
 }
 
 func waitDiscoveryDelay(ctx context.Context, delay time.Duration) error {

@@ -17,6 +17,8 @@ const maxLocationDiscoveryPages = 20
 type locationDiscoveryConfig struct {
 	MaxPages              int
 	PageDelay             time.Duration
+	RequestRetries        int
+	RetryBackoff          time.Duration
 	BedRanges             []string
 	ServerSorts           []string
 	HomeTypes             []string
@@ -37,6 +39,41 @@ type parsedBedRange struct {
 type parsedServerSort struct {
 	value    string
 	maxPages int
+}
+
+func filterListingsByDiscoveryBedRanges(listings []zillow.Listing, routes []zillow.SearchRoute, allowUnknown bool) []zillow.Listing {
+	if len(routes) == 0 {
+		return listings
+	}
+
+	filtered := make([]zillow.Listing, 0, len(listings))
+	for _, listing := range listings {
+		if listing.IsBuilding || (allowUnknown && listing.Bedrooms == nil) || listingMatchesDiscoveryBedRanges(listing, routes) {
+			filtered = append(filtered, listing)
+		}
+	}
+	return filtered
+}
+
+func listingMatchesDiscoveryBedRanges(listing zillow.Listing, routes []zillow.SearchRoute) bool {
+	for _, route := range routes {
+		minimum := route.Filters.MinBeds
+		maximum := route.Filters.MaxBeds
+		if minimum <= 0 && maximum <= 0 {
+			return true
+		}
+		if listing.Bedrooms == nil {
+			continue
+		}
+		if minimum > 0 && *listing.Bedrooms < minimum {
+			continue
+		}
+		if maximum > 0 && *listing.Bedrooms > maximum {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func buildLocationDiscoveryOptions(config locationDiscoveryConfig) (zillow.DiscoveryOptions, error) {
@@ -137,7 +174,10 @@ func buildLocationDiscoveryOptions(config locationDiscoveryConfig) (zillow.Disco
 	if len(routes) > 16 {
 		return zillow.DiscoveryOptions{}, errors.New("route matrix exceeds 16 combinations")
 	}
-	return zillow.DiscoveryOptions{Routes: routes, MaxPages: maxPages, PageDelay: config.PageDelay}, nil
+	return zillow.DiscoveryOptions{
+		Routes: routes, MaxPages: maxPages, PageDelay: config.PageDelay,
+		RequestRetries: config.RequestRetries, RetryBackoff: config.RetryBackoff,
+	}, nil
 }
 
 func parseBedRanges(values []string, fallbackMin, fallbackMax float64) ([]parsedBedRange, error) {

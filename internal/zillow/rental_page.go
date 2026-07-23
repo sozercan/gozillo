@@ -24,6 +24,11 @@ type RentalPage struct {
 	Properties []Property `json:"properties"`
 }
 
+type communityPropertyCandidate struct {
+	property Property
+	dedupKey string
+}
+
 // FetchRentalPage downloads and parses either an individual property page or
 // an apartment-community page.
 func (c *Client) FetchRentalPage(ctx context.Context, rawURL string) (*RentalPage, error) {
@@ -133,74 +138,77 @@ func normalizeCommunityProperties(building map[string]any, sourceURL string, inc
 	}
 	commonAmenities := recursiveStrings(building["commonUnitAmenities"])
 
-	properties := make([]Property, 0)
+	candidates := make([]communityPropertyCandidate, 0)
 	floorPlans, _ := building["floorPlans"].([]any)
-	for _, rawFloorPlan := range floorPlans {
+	for floorPlanIndex, rawFloorPlan := range floorPlans {
 		floorPlan, ok := rawFloorPlan.(map[string]any)
 		if !ok {
 			continue
 		}
 		units, _ := floorPlan["units"].([]any)
 		addedUnit := false
-		for _, rawUnit := range units {
+		for unitIndex, rawUnit := range units {
 			unit, ok := rawUnit.(map[string]any)
 			if !ok {
 				continue
 			}
 			property, ok := normalizeCommunityRental(building, floorPlan, unit, baseAddress, baseCoordinates, baseDescription, commonAmenities, buildingSharedLaundry, sourceURL, includeRaw, false)
 			if ok {
-				properties = append(properties, property)
+				candidates = append(candidates, communityPropertyCandidate{
+					property: property,
+					dedupKey: communityPropertyDedupKey(property.ID, fmt.Sprintf("floorPlans[%d].units[%d]", floorPlanIndex, unitIndex)),
+				})
 				addedUnit = true
 			}
 		}
 		if !addedUnit {
 			property, ok := normalizeCommunityRental(building, floorPlan, nil, baseAddress, baseCoordinates, baseDescription, commonAmenities, buildingSharedLaundry, sourceURL, includeRaw, true)
 			if ok {
-				properties = append(properties, property)
+				candidates = append(candidates, communityPropertyCandidate{
+					property: property,
+					dedupKey: communityPropertyDedupKey(property.ID, fmt.Sprintf("floorPlans[%d]", floorPlanIndex)),
+				})
 			}
 		}
 	}
 	if units, ok := building["ungroupedUnits"].([]any); ok {
-		for _, rawUnit := range units {
+		for unitIndex, rawUnit := range units {
 			unit, ok := rawUnit.(map[string]any)
 			if !ok {
 				continue
 			}
 			property, ok := normalizeCommunityRental(building, nil, unit, baseAddress, baseCoordinates, baseDescription, commonAmenities, buildingSharedLaundry, sourceURL, includeRaw, false)
 			if ok {
-				properties = append(properties, property)
+				candidates = append(candidates, communityPropertyCandidate{
+					property: property,
+					dedupKey: communityPropertyDedupKey(property.ID, fmt.Sprintf("ungroupedUnits[%d]", unitIndex)),
+				})
 			}
 		}
 	}
-	return deduplicateCommunityProperties(properties)
+	return deduplicateCommunityProperties(candidates)
 }
 
 func normalizeCommunityRental(building, floorPlan, unit map[string]any, baseAddress Address, baseCoordinates Coordinates, baseDescription string, commonAmenities []string, buildingSharedLaundry bool, sourceURL string, includeRaw, floorPlanOnly bool) (Property, bool) {
 	value := mergeCommunityValues(floorPlan, unit)
-	id := firstString(value, "zpid")
-	if id == "" && floorPlan != nil {
-		id = firstString(floorPlan, "zpid")
+	id := communityZPID(unit)
+	if unit == nil {
+		id = communityZPID(floorPlan)
 	}
-	price := moneyPointer(value, "baseRent", "minBaseRent", "minPrice", "price")
-	if price == nil && floorPlan != nil {
-		price = moneyPointer(floorPlan, "minBaseRent", "minPrice", "price")
-	}
-	availability := normalizedAvailability(firstNonNil(value["availableFrom"], value["availabilityDate"]))
-	if availability == "" && floorPlan != nil {
-		availability = normalizedAvailability(firstNonNil(floorPlan["availableFrom"], floorPlan["availabilityDate"]))
-	}
+	price := firstMoneyPointer(unit, floorPlan, "baseRent", "minBaseRent", "minPrice", "price")
+	availability := firstNormalizedAvailability(unit, floorPlan, "availableFrom", "availabilityDate")
 	if id == "" && price == nil && availability == "" {
 		return Property{}, false
 	}
 
 	address := baseAddress
-	unitNumber := firstString(value, "unitNumber")
+	unitNumber := firstString(unit, "unitNumber")
 	if unitNumber != "" {
 		address.Street = strings.TrimSpace(address.Street + " #" + unitNumber)
 		address.Full = joinAddress(address)
 	}
-	description := strings.TrimSpace(strings.Join(nonEmpty(firstString(value, "description", "additionalInformation"), firstString(floorPlan, "description", "additionalInformation"), baseDescription), " | "))
-	unitAmenities := append(recursiveStrings(value["amenityDetails"]), recursiveStrings(value["unitFeatures"])...)
+	description := strings.TrimSpace(strings.Join(nonEmpty(firstString(unit, "description", "additionalInformation"), firstString(floorPlan, "description", "additionalInformation"), baseDescription), " | "))
+	unitAmenities := append(recursiveStrings(unit["amenityDetails"]), recursiveStrings(unit["unitFeatures"])...)
 	floorAmenities := []string(nil)
 	if floorPlan != nil {
 		floorAmenities = append(recursiveStrings(floorPlan["amenityDetails"]), recursiveStrings(floorPlan["unitFeatures"])...)
@@ -216,16 +224,10 @@ func normalizeCommunityRental(building, floorPlan, unit map[string]any, baseAddr
 	parking := classifyParking(uniqueStrings(append(unitAmenities, floorAmenities...)), description)
 	reso := map[string]any{"interiorFeatures": amenities}
 	flexSpaces := classifyFlexSpaces(description, reso, parking)
-	allowedPets := uniqueStrings(append(stringValues(value["allowedPets"]), stringValues(floorPlanValue(floorPlan, "allowedPets"))...))
+	allowedPets := uniqueStrings(append(stringValues(unit["allowedPets"]), stringValues(floorPlanValue(floorPlan, "allowedPets"))...))
 
-	fees := moneyPointer(value, "totalRequiredMonthlyMinFee")
-	if fees == nil && floorPlan != nil {
-		fees = moneyPointer(floorPlan, "totalRequiredMonthlyMinFee")
-	}
-	includesFees := boolPointer(value, "listPriceIncludesRequiredMonthlyFees")
-	if includesFees == nil && floorPlan != nil {
-		includesFees = boolPointer(floorPlan, "listPriceIncludesRequiredMonthlyFees")
-	}
+	fees := firstMoneyPointer(unit, floorPlan, "totalRequiredMonthlyMinFee")
+	includesFees := firstBoolPointer(unit, floorPlan, "listPriceIncludesRequiredMonthlyFees")
 	total := totalMonthlyCost(price, fees, includesFees)
 
 	property := Property{
@@ -236,11 +238,11 @@ func normalizeCommunityRental(building, floorPlan, unit map[string]any, baseAddr
 		RequiredMonthlyFees:       fees,
 		TotalMonthlyCost:          total,
 		PriceIncludesRequiredFees: includesFees,
-		Bedrooms:                  firstFloatPointer(value, floorPlan, "beds", "bedrooms"),
-		Bathrooms:                 firstFloatPointer(value, floorPlan, "baths", "bathrooms"),
-		LivingArea:                firstInt64Pointer(value, floorPlan, "sqft", "livingArea", "area"),
+		Bedrooms:                  firstFloatPointer(unit, floorPlan, "beds", "bedrooms"),
+		Bathrooms:                 firstFloatPointer(unit, floorPlan, "baths", "bathrooms"),
+		LivingArea:                firstInt64Pointer(unit, floorPlan, "sqft", "livingArea", "area"),
 		HomeType:                  "APARTMENT",
-		Status:                    "FOR_RENT",
+		Status:                    firstStringFromSources(unit, floorPlan, "homeStatus", "statusType", "statusText"),
 		Description:               description,
 		Coordinates:               baseCoordinates,
 		Availability:              availability,
@@ -279,12 +281,26 @@ func mergeCommunityValues(floorPlan, unit map[string]any) map[string]any {
 	if result == nil {
 		result = make(map[string]any)
 	}
+	if unit != nil {
+		delete(result, "zpid")
+	}
 	for key, value := range unit {
 		if value != nil {
 			result[key] = cloneJSONValue(value)
 		}
 	}
 	return result
+}
+
+func communityZPID(raw map[string]any) string {
+	if raw == nil {
+		return ""
+	}
+	id, ok := normalizeZPID(raw["zpid"])
+	if !ok {
+		return ""
+	}
+	return id
 }
 
 func floorPlanValue(floorPlan map[string]any, key string) any {
@@ -304,6 +320,43 @@ func boolPointer(raw map[string]any, key string) *bool {
 	}
 	copy := value
 	return &copy
+}
+
+func firstStringFromSources(primary, fallback map[string]any, keys ...string) string {
+	if value := firstString(primary, keys...); value != "" {
+		return value
+	}
+	return firstString(fallback, keys...)
+}
+
+func firstMoneyPointer(primary, fallback map[string]any, keys ...string) *int64 {
+	if value := moneyPointer(primary, keys...); value != nil {
+		return value
+	}
+	return moneyPointer(fallback, keys...)
+}
+
+func firstBoolPointer(primary, fallback map[string]any, key string) *bool {
+	if value := boolPointer(primary, key); value != nil {
+		return value
+	}
+	return boolPointer(fallback, key)
+}
+
+func firstNormalizedAvailability(primary, fallback map[string]any, keys ...string) string {
+	if value := normalizedAvailabilityFromSource(primary, keys...); value != "" {
+		return value
+	}
+	return normalizedAvailabilityFromSource(fallback, keys...)
+}
+
+func normalizedAvailabilityFromSource(raw map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value := normalizedAvailability(raw[key]); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func firstFloatPointer(primary, fallback map[string]any, keys ...string) *float64 {
@@ -345,19 +398,28 @@ func communityPropertyURL(id, fallback string) string {
 	return ""
 }
 
-func deduplicateCommunityProperties(properties []Property) []Property {
-	result := make([]Property, 0, len(properties))
+func communityPropertyDedupKey(id, sourcePath string) string {
+	if id != "" {
+		return "zpid:" + id
+	}
+	// Source paths keep ZPID-less floor plans and units distinct without
+	// exposing an internal identity as a Zillow property ID.
+	return "source:" + sourcePath
+}
+
+func deduplicateCommunityProperties(candidates []communityPropertyCandidate) []Property {
+	result := make([]Property, 0, len(candidates))
 	seen := make(map[string]struct{})
-	for _, property := range properties {
-		key := property.ID
+	for _, candidate := range candidates {
+		key := candidate.dedupKey
 		if key == "" {
-			key = property.URL + "|" + property.Address.Full
+			key = candidate.property.URL + "|" + candidate.property.Address.Full
 		}
 		if _, exists := seen[key]; exists {
 			continue
 		}
 		seen[key] = struct{}{}
-		result = append(result, property)
+		result = append(result, candidate.property)
 	}
 	return result
 }

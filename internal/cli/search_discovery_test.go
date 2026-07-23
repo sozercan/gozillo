@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"reflect"
 	"testing"
 	"time"
 
@@ -11,13 +12,15 @@ func TestBuildLocationDiscoveryOptionsCreatesRouteMatrix(t *testing.T) {
 	t.Parallel()
 
 	options, err := buildLocationDiscoveryOptions(locationDiscoveryConfig{
-		MaxPages:      3,
-		PageDelay:     5 * time.Second,
-		BedRanges:     []string{"2", "3+"},
-		ServerSorts:   []string{"days", "mostrecentchange"},
-		HomeTypes:     []string{"apartment", "condo", "townhouse", "single-family"},
-		ForRent:       true,
-		InUnitLaundry: true,
+		MaxPages:       3,
+		PageDelay:      5 * time.Second,
+		RequestRetries: 2,
+		RetryBackoff:   30 * time.Second,
+		BedRanges:      []string{"2", "3+"},
+		ServerSorts:    []string{"days", "mostrecentchange"},
+		HomeTypes:      []string{"apartment", "condo", "townhouse", "single-family"},
+		ForRent:        true,
+		InUnitLaundry:  true,
 		BaseFilters: zillow.SearchFilters{
 			MaxPrice: 5500,
 			MinBaths: 2,
@@ -26,7 +29,7 @@ func TestBuildLocationDiscoveryOptionsCreatesRouteMatrix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if options.MaxPages != 3 || options.PageDelay != 5*time.Second {
+	if options.MaxPages != 3 || options.PageDelay != 5*time.Second || options.RequestRetries != 2 || options.RetryBackoff != 30*time.Second {
 		t.Fatalf("options = %+v", options)
 	}
 	if len(options.Routes) != 4 {
@@ -54,6 +57,55 @@ func TestBuildLocationDiscoveryOptionsCreatesRouteMatrix(t *testing.T) {
 		if len(route.Filters.HomeTypes) != 4 {
 			t.Errorf("route %d home types = %v", index, route.Filters.HomeTypes)
 		}
+	}
+}
+
+func TestDiscoveryHomeTypeFilterDefersUnknownCardsForEnrichment(t *testing.T) {
+	t.Parallel()
+
+	price := int64(4200)
+	beds := 3.0
+	baths := 2.0
+	filters := zillow.SearchFilters{
+		MaxPrice: 5500, MinBeds: 3, MinBaths: 2,
+		HomeTypes: []string{zillow.HomeTypeApartment, zillow.HomeTypeCondo, zillow.HomeTypeTownhouse, zillow.HomeTypeSingleFamily},
+	}
+	listings := []zillow.Listing{
+		{ID: "unknown", Price: &price, Bedrooms: &beds, Bathrooms: &baths},
+		{ID: "allowed", Price: &price, Bedrooms: &beds, Bathrooms: &baths, HomeType: "SINGLE_FAMILY"},
+		{ID: "disallowed", Price: &price, Bedrooms: &beds, Bathrooms: &baths, HomeType: "MANUFACTURED"},
+	}
+
+	got := filterDiscoveredListings(listings, filters)
+	if ids := listingIDs(got); !reflect.DeepEqual(ids, []string{"unknown", "allowed"}) {
+		t.Fatalf("discovery-filtered IDs = %v", ids)
+	}
+	if strict := filterSnapshotListings(listings, filters); !reflect.DeepEqual(listingIDs(strict), []string{"allowed"}) {
+		t.Fatalf("strict snapshot-filtered IDs = %v", listingIDs(strict))
+	}
+}
+
+func TestSearchResultCacheKeyIgnoresPacingAndRetryPolicy(t *testing.T) {
+	t.Parallel()
+
+	routes := []zillow.SearchRoute{{
+		Name: "newest", MaxPages: 2,
+		Filters: zillow.SearchFilters{MinBeds: 3, Sort: "days", HomeTypes: []string{zillow.HomeTypeSingleFamily}},
+	}}
+	first := searchResultCacheKey("https://www.zillow.com/example/rentals/", false, true, zillow.DiscoveryOptions{
+		Routes: routes, MaxPages: 2, PageDelay: time.Second, RequestRetries: 1, RetryBackoff: 30 * time.Second,
+	})
+	second := searchResultCacheKey("https://www.zillow.com/example/rentals/", false, true, zillow.DiscoveryOptions{
+		Routes: routes, MaxPages: 2, PageDelay: 10 * time.Second, RequestRetries: 4, RetryBackoff: 2 * time.Minute,
+	})
+	if first != second {
+		t.Fatalf("operational options changed cache key:\nfirst:  %s\nsecond: %s", first, second)
+	}
+	different := searchResultCacheKey("https://www.zillow.com/example/rentals/", false, true, zillow.DiscoveryOptions{
+		Routes: routes, MaxPages: 3,
+	})
+	if first == different {
+		t.Fatal("semantic page limit did not change cache key")
 	}
 }
 
@@ -172,5 +224,34 @@ func TestBuildLocationDiscoveryOptionsAddsSupplementalLaundryAndKeywordRoutes(t 
 		if options.Routes[index].Filters.MinBeds != 2 || options.Routes[index].Filters.MaxBeds != 2 {
 			t.Errorf("keyword route %d beds = %+v", index, options.Routes[index].Filters)
 		}
+	}
+}
+
+func TestFilterListingsByDiscoveryBedRangesUsesRouteUnionAndDefersBuildings(t *testing.T) {
+	t.Parallel()
+
+	twoBeds := 2.0
+	threeBeds := 3.0
+	fourBeds := 4.0
+	listings := []zillow.Listing{
+		{ID: "building", IsBuilding: true, Bedrooms: &threeBeds},
+		{ID: "two", Bedrooms: &twoBeds},
+		{ID: "three", Bedrooms: &threeBeds},
+		{ID: "four", Bedrooms: &fourBeds},
+		{ID: "unknown"},
+	}
+	routes := []zillow.SearchRoute{
+		{Filters: zillow.SearchFilters{MinBeds: 2, MaxBeds: 2}},
+		{Filters: zillow.SearchFilters{MinBeds: 4}},
+	}
+
+	got := filterListingsByDiscoveryBedRanges(listings, routes, false)
+	if ids := listingIDs(got); !reflect.DeepEqual(ids, []string{"building", "two", "four"}) {
+		t.Fatalf("filtered IDs = %v", ids)
+	}
+
+	preliminary := filterListingsByDiscoveryBedRanges(listings, routes, true)
+	if ids := listingIDs(preliminary); !reflect.DeepEqual(ids, []string{"building", "two", "four", "unknown"}) {
+		t.Fatalf("preliminary filtered IDs = %v", ids)
 	}
 }

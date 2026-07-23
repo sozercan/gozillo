@@ -58,7 +58,7 @@ func detectSharedAndStudentHousing(raw map[string]any, description, address stri
 		}
 	}
 	text := canonicalText(strings.Join([]string{description, address}, " | "))
-	if sharedHousingTextPattern.MatchString(text) || roomUnitPattern.MatchString(text) {
+	if sharedHousingTextPattern.MatchString(text) || roomUnitPattern.MatchString(canonicalText(address)) {
 		shared = true
 	}
 	if studentHousingTextPattern.MatchString(text) {

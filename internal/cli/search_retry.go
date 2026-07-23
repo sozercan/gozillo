@@ -12,6 +12,17 @@ type retryPolicy struct {
 	Retries int
 	Backoff time.Duration
 	Sleep   func(context.Context, time.Duration) error
+	OnRetry func(attempt, maxAttempts int, delay time.Duration, err error)
+}
+
+func wholeLocationRetryPolicy(discovery bool, policy retryPolicy) retryPolicy {
+	if discovery {
+		// Discovery applies this retry budget to each bootstrap/page request so
+		// completed routes are retained. Replaying the whole location would nest
+		// the same backoff and repeat already successful requests.
+		policy.Retries = 0
+	}
+	return policy
 }
 
 func (policy retryPolicy) validate() error {
@@ -41,6 +52,9 @@ func fetchWithRetry[T any](ctx context.Context, policy retryPolicy, fetch func()
 		var rateLimit *zillow.RateLimitError
 		if errors.As(err, &rateLimit) && rateLimit.RetryAfter > delay {
 			delay = rateLimit.RetryAfter
+		}
+		if policy.OnRetry != nil {
+			policy.OnRetry(attempt+2, policy.Retries+1, delay, err)
 		}
 		if err := policy.Sleep(ctx, delay); err != nil {
 			return zero, err

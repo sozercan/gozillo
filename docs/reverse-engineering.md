@@ -22,8 +22,11 @@ and keyword routes. Each request asks for both `listResults` and `mapResults`,
 which are normalized and deduplicated before cross-page/route deduplication.
 Results are deduplicated across pages and routes while route-level
 coverage records whether the configured page cap reached Zillow's reported end.
-A failure on one later route page is retained as a partial-coverage issue rather
-than discarding earlier successful pages.
+A challenged or rate-limited route page uses the command's bounded retry and
+backoff policy without discarding earlier successful routes. If retries are
+exhausted, the failure is retained as a partial-coverage issue, remaining routes
+are skipped, and multi-location output includes both the earlier listings and an
+incomplete-discovery error record.
 
 Routes are constructed from a normalized location:
 
@@ -39,8 +42,10 @@ wire transport uses `tls-client` for browser-family TLS and HTTP fingerprint
 compatibility. Offline parsing does not require a profile.
 
 A proxy can be configured through `--proxy` or Go's standard proxy environment
-variables. There is no external fetch process, browser runtime, automatic proxy
-rotation, or CAPTCHA-solving integration.
+variables. Search and property commands do not launch an external fetch process
+or browser runtime, and there is no automatic proxy rotation or CAPTCHA-solving
+integration. `gozillo har capture` is separate: it attaches to a Chromium
+browser that the user started explicitly through CDP.
 
 State-qualified city input such as `Example City ST` is normalized to a stable
 route. Returned listing addresses are checked against an explicit state suffix
@@ -53,6 +58,68 @@ A clean HTTP client may be rejected even when a browser can load the same page.
 `gozillo session import` reads a user-supplied raw HAR and stores only cookies
 that were actually sent to successful first-party Zillow requests. It does not
 persist the HAR, response bodies, authorization headers, or browser identity.
+
+### CDP-backed HAR capture
+
+`gozillo har capture` can record a new navigation through an already-running
+Chrome or Edge instance:
+
+```bash
+gozillo har capture \
+  --cdp http://127.0.0.1:9222 \
+  --out "$HOME/Downloads/zillow.raw.har" \
+  'https://www.zillow.com/'
+```
+
+Start the browser with a loopback remote-debugging port and a dedicated,
+non-default user data directory. For example, use `google-chrome` or
+`microsoft-edge` on Linux (use the corresponding application executable on
+macOS):
+
+```bash
+google-chrome \
+  --remote-debugging-port=9222 \
+  --remote-debugging-address=127.0.0.1 \
+  --user-data-dir="$HOME/.gozillo/chrome-cdp"
+
+microsoft-edge \
+  --remote-debugging-port=9222 \
+  --remote-debugging-address=127.0.0.1 \
+  --user-data-dir="$HOME/.gozillo/edge-cdp"
+```
+
+The dedicated profile supplies its normal cookies and browser state to the new
+tab. Remote debugging grants control of that browser instance, so the endpoint
+must remain private; do not expose it to another machine. Non-loopback
+endpoints require the explicit `--allow-remote-cdp` flag and an exact `ws://` or
+`wss://` browser WebSocket URL; HTTP discovery is loopback-only. Use only
+session state and destinations that you are authorized to access.
+
+Capture allocates a new tab and enables CDP network recording before navigating
+to the supplied HTTP(S) URL. That ordering ensures the initial navigation is in
+the HAR. CDP cannot recover requests made before recording began, so the command
+does not reconstruct traffic from an existing, already-loaded tab.
+
+`--wait` controls how long recording continues after page load (default `5s`).
+`--timeout` bounds the complete connection, navigation, and capture operation
+(default `45s`) and must be greater than `--wait`. Response bodies are omitted by
+default; `--response-bodies` attempts to include them when they are required,
+at the cost of a larger and potentially more sensitive archive. Redirect-hop
+bodies may be unavailable after CDP reuses a request ID and are marked as such.
+Capture retains at most 10,000 entries and 128 MiB of event/body data; exceeding
+either bound fails the command rather than writing a partial archive.
+The recorder covers the primary page CDP target, including the main navigation
+and page fetch/XHR traffic needed by `gozillo`; requests emitted only by child
+targets such as dedicated workers or out-of-process iframes may be omitted. The
+HAR log records that scope in comment metadata.
+
+The output is an unsanitized HAR and can contain cookies, credential headers,
+request bodies, URLs, and, when requested, response bodies. `gozillo` writes it
+atomically with owner-only mode `0600` on supported systems. Owner-only HAR
+writes are currently unsupported on Windows. Never commit, upload, paste, or
+share a raw capture; sanitize or delete it as soon as it is no longer needed.
+This capture path does not bypass authentication, rate limits, bot protections,
+or other access controls.
 
 Imported sessions are best-effort:
 
@@ -177,10 +244,26 @@ preserved when another location fails, and JSONL emits either:
 {"location":"<location>","error":"..."}
 ```
 
-Successful location responses and property details can be cached. Failed or
-challenged locations are not cached, so repeating overlapping commands may
-request the same failing route again. Retries and several independent filter
-passes can therefore amplify traffic rather than improve coverage.
+Successful location responses and property details can be cached. Search-cache
+identity includes semantic route filters and page limits, but not pacing or retry
+settings, so changing a delay does not force an otherwise identical request set.
+Failed or incomplete locations are not cached.
+
+`--progress` writes request-plan, location, route/page, retry-cooldown, and
+property-detail progress to stderr. Multi-location JSONL is emitted as each
+location completes. Discovery consumes the retry budget per bootstrap/page
+request, does not replay the entire route matrix afterward, and stops remaining
+routes when a retryable response exhausts that budget. A retryable
+property-detail response opens a location-scoped circuit breaker so queued
+detail and recency requests for that location are skipped. The circuit resets
+before required detail enrichment begins for the next location.
+
+Recency verification runs after community expansion, authoritative location
+boundary checks, and every detail filter except `max-days-on-zillow`. Only the
+surviving unit URLs receive the optional recency request; the max-days filter,
+newest sort, limit, and history annotation remain afterward. `GOZILLO_CACHE_DIR`
+can place the search/property cache outside a run-local `GOZILLO_CONFIG_DIR`,
+allowing dated runs to share entries without sharing imported session files.
 
 For a session-sensitive or large workflow:
 
@@ -188,7 +271,7 @@ For a session-sensitive or large workflow:
 2. use one multi-location process;
 3. request an inclusive candidate set once;
 4. use conservative location/detail delays and bounded concurrency;
-5. disable retries when challenged routes should not be replayed;
+5. use bounded cooldown retries in the same process instead of replaying separate filter passes;
 6. split, rank, and deduplicate the JSON/JSONL output locally.
 
 This structure preserves cookie evolution and avoids repeating the same search

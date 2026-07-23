@@ -54,7 +54,7 @@ Global options:
 Commands:
   search    Search Zillow through pure Go HTTP or a saved snapshot
   property  Extract normalized Zillow property details
-  har       Sanitize HARs and derive Zillow request profiles
+  har       Capture, sanitize, and derive Zillow HAR data
   session   Import and manage file-backed Zillow sessions
   version   Print the gozillo version
 `

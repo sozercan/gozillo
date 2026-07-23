@@ -19,6 +19,8 @@ func TestDetectSharedAndStudentHousingSignals(t *testing.T) {
 		{name: "per bed description", description: "Individual leases priced per bed", shared: true},
 		{name: "co living", description: "Modern co-living community", shared: true},
 		{name: "room unit identifier", address: "100 Example Ave #Unit 203RM3", shared: true},
+		{name: "bedroom identifier in address", address: "100 Example Ave, Bedroom A", shared: true},
+		{name: "ordinary bedroom description", description: "Bright two bedroom apartment", address: "100 Example Ave #203"},
 		{name: "ordinary apartment", description: "Entire apartment for rent", address: "100 Example Ave #203"},
 	}
 	for _, test := range tests {

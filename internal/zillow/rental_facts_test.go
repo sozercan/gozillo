@@ -185,3 +185,34 @@ func TestRentalHistoryRecencyUsesLatestCurrentRentalListing(t *testing.T) {
 		t.Fatalf("recency = (%q, %q, %v)", listed, updated, days)
 	}
 }
+
+func TestRentalHistoryRecencyAppliesLifecycleResetWithoutRentalFlag(t *testing.T) {
+	t.Parallel()
+
+	for _, event := range []string{"Listing removed", "Removed listing", "Off market", "Sold", "Pending sale"} {
+		for _, flag := range []struct {
+			name    string
+			present bool
+		}{
+			{name: "absent"},
+			{name: "false", present: true},
+		} {
+			t.Run(event+"/"+flag.name, func(t *testing.T) {
+				reset := map[string]any{"date": "2026-07-10", "event": event}
+				if flag.present {
+					reset["postingIsRental"] = false
+				}
+				raw := map[string]any{
+					"priceHistory": []any{
+						map[string]any{"date": "2026-07-01", "event": "Listed for rent", "postingIsRental": true},
+						reset,
+					},
+				}
+				listed, updated, days := rentalHistoryRecency(raw, time.Date(2026, time.July, 21, 0, 0, 0, 0, time.UTC))
+				if listed != "" || updated != "" || days != nil {
+					t.Fatalf("recency = (%q, %q, %v), want reset lifecycle", listed, updated, days)
+				}
+			})
+		}
+	}
+}

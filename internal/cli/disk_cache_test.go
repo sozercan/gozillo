@@ -46,6 +46,7 @@ func TestDefaultDiskCacheUsesGozilloConfigDirectory(t *testing.T) {
 		t.Skip("permission behavior differs on Windows")
 	}
 	base := t.TempDir()
+	t.Setenv("GOZILLO_CACHE_DIR", "")
 	t.Setenv("GOZILLO_CONFIG_DIR", base)
 	cache, err := defaultDiskCache("search", time.Minute)
 	if err != nil {
@@ -53,5 +54,42 @@ func TestDefaultDiskCacheUsesGozilloConfigDirectory(t *testing.T) {
 	}
 	if cache.Dir != filepath.Join(base, "cache", "search") {
 		t.Fatalf("Dir = %q", cache.Dir)
+	}
+}
+
+func TestDefaultDiskCachePrefersGozilloCacheDirectory(t *testing.T) {
+	cacheBase := t.TempDir()
+	t.Setenv("GOZILLO_CACHE_DIR", cacheBase)
+	t.Setenv("GOZILLO_CONFIG_DIR", filepath.Join(t.TempDir(), "config"))
+	cache, err := defaultDiskCache("property", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cache.Dir != filepath.Join(cacheBase, "property") {
+		t.Fatalf("Dir = %q", cache.Dir)
+	}
+}
+
+func TestDiskCacheIsSharedAcrossRunConfigDirectories(t *testing.T) {
+	cacheBase := t.TempDir()
+	t.Setenv("GOZILLO_CACHE_DIR", cacheBase)
+	t.Setenv("GOZILLO_CONFIG_DIR", filepath.Join(t.TempDir(), "run-a"))
+	first, err := defaultDiskCache("search", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Save("shared-key", cacheFixture{Name: "shared-value"}); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("GOZILLO_CONFIG_DIR", filepath.Join(t.TempDir(), "run-b"))
+	second, err := defaultDiskCache("search", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got cacheFixture
+	hit, err := second.Load("shared-key", &got)
+	if err != nil || !hit || got.Name != "shared-value" {
+		t.Fatalf("Load() = (%+v, %t, %v)", got, hit, err)
 	}
 }
