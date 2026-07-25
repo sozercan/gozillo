@@ -4,6 +4,9 @@ This document records the current transport, session, parsing, and reliability
 boundaries of `gozillo`. Examples intentionally use placeholders rather than a
 particular search, address, account, or captured browser identity.
 
+For user-facing workflows, see the [browser session guide](browser-session.md)
+and [search guide](search-guide.md).
+
 ## Result-page transport
 
 The default location mode fetches Zillow search-results-page HTML and extracts:
@@ -271,7 +274,8 @@ For a session-sensitive or large workflow:
 2. use one multi-location process;
 3. request an inclusive candidate set once;
 4. use conservative location/detail delays and bounded concurrency;
-5. use bounded cooldown retries in the same process instead of replaying separate filter passes;
+5. use bounded cooldown retries in the same process instead of replaying
+   separate filter passes;
 6. split, rank, and deduplicate the JSON/JSONL output locally.
 
 This structure preserves cookie evolution and avoids repeating the same search
@@ -338,11 +342,10 @@ performs a second pass over expanded unit URLs without discarding already
 confirmed facts when that pass fails. Individual unit pages can expose a
 current rental cycle in `priceHistory`; the normalizer uses the most recent
 post-removal “Listed for rent” event and subsequent rental updates to derive
-listed/updated dates and exact calendar days. When neither source exists,
-exporters preserve an explicit `Unknown` value with evidence and last-checked
-fields rather than deriving age from availability or page-render timestamps. Other
-alternate landing pages without either supported structure remain
-schema-unavailable.
+listed/updated dates and exact calendar days. When neither source exists, the
+recency fields remain unset rather than being inferred from availability or
+page-render timestamps. Other alternate landing pages without either supported
+structure remain schema-unavailable.
 
 ## Structured rental facts
 

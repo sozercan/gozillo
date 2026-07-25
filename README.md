@@ -9,7 +9,7 @@
 </p>
 
 `gozillo` searches locations, filters listings, fetches structured property
-details, and prints clean table, JSON, or JSONL output. Live requests use a
+information, and prints table, JSON, or JSONL output. Live requests use a
 [`tls-client`](https://github.com/bogdanfinn/tls-client) browser profile and can
 reuse cookies from a fresh browser HAR capture.
 
@@ -19,179 +19,57 @@ reuse cookies from a fresh browser HAR capture.
 
 ## Features
 
-- Search one or many cities and ZIP codes.
-- Run bounded server-side bedroom, home-type, Newest, and Recently Changed routes.
-- Paginate each route with conservative request delays and per-location caps.
-- Expand Zillow apartment-community pages into available units or floor plans.
-- Filter by base rent, known total monthly cost, beds, baths, availability, and freshness.
-- Verify laundry, parking, pets, status, fees, and flex-space details from Zillow pages.
-- Compare with a previous JSON/JSONL run to label new, changed, and still-active listings.
-- Sort locally by newest, price, beds, or square footage.
-- Reuse a browser session from a fresh HAR capture.
-- Use HTTP, HTTPS, SOCKS5, or SOCKS5H proxies.
-- Work offline with saved HTML or `__NEXT_DATA__` snapshots.
+- Search one or many cities and ZIP codes with bounded pagination and pacing.
+- Filter and sort by price, known monthly cost, beds, baths, availability,
+  freshness, home type, and listing details.
+- Expand apartment-community pages into available units or floor plans.
+- Compare a previous run to identify new, changed, and still-active listings.
+- Reuse browser-derived sessions and HTTP(S) or SOCKS proxies.
+- Parse saved HTML or `__NEXT_DATA__` snapshots without network access.
 
 ## Install
 
 Requires Go 1.24.1 or newer.
 
 ```bash
-go build -o gozillo ./cmd/gozillo
+make build
 ./gozillo --help
 ```
 
 ## Quick start
 
-### 1. Capture a non-sanitized HAR in Edge or Chrome
+Live searches require a compatible `tls-client` profile. When browser state is
+needed, you can also reuse a fresh session and matching browser identity.
 
-#### Automatic capture through CDP
-
-The quickest way to start a dedicated Edge instance is:
+Start a dedicated Edge instance with CDP enabled on loopback:
 
 ```bash
 make edge-cdp
-# or: ./scripts/open-edge-cdp.sh
 ```
 
-Override the defaults with `GOZILLO_CDP_PORT` or
-`GOZILLO_CDP_PROFILE_DIR` when needed.
-
-Start a separate Chrome or Edge instance with a remote-debugging port and a
-**dedicated, non-default** user data directory. Remote debugging grants control
-of that browser instance, so keep the endpoint on loopback and do not expose
-port `9222` to another machine. Non-loopback endpoints are rejected unless
-`--allow-remote-cdp` is supplied explicitly. Remote capture requires an exact
-`ws://` or `wss://` browser WebSocket URL; HTTP discovery remains loopback-only.
-
-macOS examples:
-
-```bash
-# Chrome
-"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
-  --remote-debugging-port=9222 \
-  --remote-debugging-address=127.0.0.1 \
-  --user-data-dir="$HOME/.gozillo/chrome-cdp"
-
-# Edge
-"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge" \
-  --remote-debugging-port=9222 \
-  --remote-debugging-address=127.0.0.1 \
-  --user-data-dir="$HOME/.gozillo/edge-cdp"
-```
-
-Linux examples; adjust the executable name for your installation:
-
-```bash
-# Chrome
-google-chrome \
-  --remote-debugging-port=9222 \
-  --remote-debugging-address=127.0.0.1 \
-  --user-data-dir="$HOME/.gozillo/chrome-cdp"
-
-# Edge
-microsoft-edge \
-  --remote-debugging-port=9222 \
-  --remote-debugging-address=127.0.0.1 \
-  --user-data-dir="$HOME/.gozillo/edge-cdp"
-```
-
-Use that dedicated browser normally to establish only the session state you are
-authorized to use. Then capture one new navigation:
+Use that dedicated browser to establish a successful Zillow session you are
+authorized to use. Then capture a new navigation and import its first-party
+cookies:
 
 ```bash
 HAR="$HOME/Downloads/zillow.raw.har"
 
-gozillo har capture \
+./gozillo har capture \
   --cdp http://127.0.0.1:9222 \
   --out "$HAR" \
   'https://www.zillow.com/'
+
+./gozillo session import --name default "$HAR"
 ```
 
-The general form is
-`gozillo har capture --cdp http://127.0.0.1:9222 --out <path> <https-url>`.
-The command opens a new tab, starts CDP network recording, and only then
-navigates to the supplied URL. CDP cannot recover requests that occurred before
-recording began, so this does not capture an already-loaded tab's past traffic.
-
-Capture controls:
-
-- `--wait <duration>` keeps recording after page load (default `5s`) for
-  follow-up requests.
-- `--timeout <duration>` bounds connection, navigation, and capture time
-  (default `45s`) and must be longer than `--wait`.
-- `--response-bodies` attempts to save response bodies. It is off by default
-  because bodies can make the HAR much larger and can contain additional
-  sensitive data. CDP cannot reliably return redirect-hop bodies after request
-  IDs are reused, so those entries are marked as incomplete.
-- Capture retention is bounded to 10,000 entries and 128 MiB of retained event
-  data; the command fails instead of writing a partial HAR if either limit is
-  exceeded.
-
-The recorder targets the primary page session, which contains the first-party
-navigation and fetch/XHR traffic used by `gozillo`. Requests emitted only from
-child CDP targets, such as dedicated workers or out-of-process iframes, may be
-omitted; the HAR log includes this limitation in its comment metadata.
-
-`gozillo` writes the raw HAR atomically with owner-only mode `0600` on supported
-systems. Owner-only HAR writes are currently unsupported on Windows; use the
-manual export flow below there and protect the resulting file appropriately.
-
-#### Manual DevTools export
-
-Edge and Chrome omit cookies and authorization data from sanitized HAR
-exports. A session import needs the **non-sanitized** export:
-
-1. Open Zillow in Microsoft Edge or Google Chrome and open DevTools:
-   - macOS: **Command+Option+I**
-   - Windows/Linux: **Ctrl+Shift+I**
-2. Select the **Network** panel.
-3. Open DevTools **Settings** with the gear icon or **F1**.
-4. Under **Preferences > Network**, enable
-   **Allow to generate HAR with sensitive data**.
-5. Return to Network, clear old requests, remove filters, and reload the page.
-6. Complete the normal browser flow and wait for the page to finish loading.
-7. Open **Export HAR** and select **Export HAR (with sensitive data)**.
-
-The same Chromium DevTools flow is documented in the
-[Microsoft Edge Network reference](https://learn.microsoft.com/en-us/microsoft-edge/devtools/network/reference#save-all-network-requests-to-a-har-file)
-and the
-[Chrome Network reference](https://developer.chrome.com/docs/devtools/network/reference/#save-as-har).
-
-Save the capture somewhere private:
-
-```bash
-HAR="$HOME/Downloads/zillow.har"
-chmod 600 "$HAR"
-```
-
-A non-sanitized HAR is a plaintext secret. Never commit, upload, paste, or share
-it. Delete it when it is no longer needed. CDP capture is a recording mechanism,
-not a way to bypass authentication, rate limits, bot protections, or other
-access controls.
-
-### 2. Import the session
-
-```bash
-gozillo session import --name default "$HAR"
-gozillo session inspect --name default
-```
-
-The importer stores first-party Zillow cookies from successful requests. It
-does not store the HAR, response bodies, authorization headers, or browser
-User-Agent.
-
-### 3. Search
-
-Live requests require a `tls-client` profile. Start with the nearest profile
-for the captured browser family, but treat profile selection as a compatibility
-test rather than a strict browser-name match:
+Run a search with the captured browser identity:
 
 ```bash
 LOCATION='Example City ST'
 TLS_PROFILE='<working tls-client profile>'
 CAPTURED_UA='<User-Agent from the successful browser request>'
 
-gozillo search \
+./gozillo search \
   --location "$LOCATION" \
   --rent \
   --session default \
@@ -199,51 +77,18 @@ gozillo search \
   --user-agent "$CAPTURED_UA"
 ```
 
-Use an explicitly state-qualified city name when possible. Add the matching
-navigation headers described below when the captured browser sent them.
+A raw HAR is a plaintext secret. Never commit, upload, paste, or share it, and
+delete it when it is no longer needed. See the
+[browser session guide](docs/browser-session.md) for Chrome and Edge setup,
+manual HAR export, browser headers, privacy, and troubleshooting.
 
-## Browser identity
+## Common usage
 
-A TLS profile, User-Agent, and browser navigation headers are separate parts
-of the request. Keep the User-Agent and client hints exactly as captured from a
-successful browser request. Do not rewrite them to match the TLS profile name.
-For a Chromium-family capture, the additional flags may look like:
-
-```bash
-SEC_CH_UA='<Sec-CH-UA value from the successful browser request>'
-
-gozillo search \
-  --location "$LOCATION" \
-  --rent \
-  --session default \
-  --tls-profile "$TLS_PROFILE" \
-  --user-agent "$CAPTURED_UA" \
-  --browser-header "Sec-CH-UA: $SEC_CH_UA" \
-  --browser-header 'Accept-Language: en-US,en;q=0.9' \
-  --browser-header 'Sec-Fetch-Dest: document' \
-  --browser-header 'Sec-Fetch-Mode: navigate'
-```
-
-`--browser-header` accepts only non-credential navigation headers. Cookies,
-authorization, User-Agent, origin, referrer, and host headers cannot be supplied
-through it.
-
-An Edge User-Agent contains a Chrome compatibility token but still identifies
-itself as Edge, and its client hints may do the same. A Safari-named TLS profile
-does not turn the captured User-Agent into Safari.
-
-Start with the nearest family profile—Chrome-family for Edge or Chrome,
-Safari-family for Safari, and Firefox-family for Firefox. Browser releases may
-be newer than the bundled profiles, and the nearest profile is only a
-best-effort starting point. If it is rejected, keep the captured User-Agent and
-headers unchanged while testing another available profile.
-
-## Search examples
-
-### Multiple locations
+Search multiple locations in one process so they share the same in-memory
+cookie jar:
 
 ```bash
-gozillo search \
+./gozillo search \
   --location 'First City ST' \
   --location 'Second City ST' \
   --rent \
@@ -252,174 +97,23 @@ gozillo search \
   --sort-by newest
 ```
 
-For session-sensitive searches, put the full location set in one command so all
-requests share the same in-memory cookie jar.
-
-### Deep Zillow discovery
-
-Location mode can bootstrap Zillow's rendered page and then use bounded
-server-side result routes. This avoids treating the first Recommended page as
-complete inventory:
+Parse a saved snapshot without a TLS profile:
 
 ```bash
-PREVIOUS='./previous-results.jsonl'
-TARGET_END='YYYY-MM-DD'
-
-gozillo --output=jsonl search \
-  --location 'First City ST' \
-  --location 'Second City ST' \
-  --rent \
-  --session default \
-  --tls-profile "$TLS_PROFILE" \
-  --user-agent "$CAPTURED_UA" \
-  --bed-range 2 \
-  --bed-range 3+ \
-  --server-sort days:3 \
-  --server-sort mostrecentchange:1 \
-  --supplemental-no-laundry \
-  --supplemental-pages 1 \
-  --keyword-route den \
-  --keyword-route office \
-  --keyword-route 'private garage' \
-  --max-pages 3 \
-  --page-delay 5s \
-  --home-type apartment,condo,townhouse,single-family \
-  --strict-location-boundary \
-  --allowed-city 'First City,Second City' \
-  --max-price 3500 \
-  --max-total-cost 3500 \
-  --min-baths 2 \
-  --available-by "$TARGET_END" \
-  --unknown-availability watchlist \
-  --out-of-window-availability watchlist \
-  --verify-rental-status \
-  --verify-recency \
-  --exclude-shared-housing \
-  --exclude-student-housing \
-  --exclude-income-restricted \
-  --laundry in-unit \
-  --unknown-laundry watchlist \
-  --previous-results "$PREVIOUS" \
-  --sort-by newest
+./gozillo search --snapshot search.next.json --limit 20
+./gozillo property ./property.html
 ```
 
-A server sort may include its own page cap, such as `days:3`. Use
-`--location-max-pages 'Priority City ST=3'` to give selected locations more
-depth while keeping one process and cookie jar. Discovery merges Zillow list
-and map results. Supplemental no-laundry routes cover listings whose in-unit
-laundry was not indexed, while exact-two-bedroom keyword routes improve flex
-recall. Shared-room, co-living, dorm-style, student-housing, and structured
-income-restriction signals can be excluded after Zillow detail expansion. Strict boundary and allowed-city checks remove cross-boundary results.
-Community results are expanded from Zillow's structured unit and floor-plan
-data; floor-plan-only or otherwise uncertain results remain watchlist items.
-
-### Filters and property details
+Set the output mode before the command:
 
 ```bash
-gozillo --output=jsonl search \
-  --location "$LOCATION" \
-  --rent \
-  --session default \
-  --tls-profile "$TLS_PROFILE" \
-  --max-price 3500 \
-  --max-total-cost 3500 \
-  --min-beds 2 \
-  --min-baths 1 \
-  --min-sqft 800 \
-  --verify-rental-status \
-  --verify-recency \
-  --exclude-shared-housing \
-  --exclude-student-housing \
-  --exclude-income-restricted \
-  --laundry in-unit \
-  --unknown-laundry watchlist \
-  --flex den,office,bonus,loft,private-garage \
-  --sort-by newest
+./gozillo --output=table search ...
+./gozillo --output=json search ...
+./gozillo --output=jsonl search ...
 ```
 
-Laundry, total-cost, rental-status, parking, pet, and flex filters automatically
-fetch Zillow detail pages. Apartment-community pages can produce multiple unit
-or floor-plan results. Use `--page-delay`, `--detail-delay`, and
-`--location-delay` to reduce request frequency for larger searches. Add
-`--progress` for line-oriented location, route/page, retry, and detail progress
-on stderr; stdout remains machine-readable. Multi-location JSONL is flushed as
-each location completes. After a challenge or rate limit, queued property-detail
-requests for that location are skipped instead of continuing through the whole
-batch; later locations start with a fresh detail circuit.
-
-When `--verify-recency` is enabled, post-expansion location checks and all
-recency-independent detail filters run first. Unit-page recency requests are
-therefore limited to listings that can still survive the final result set;
-`--max-days-on-zillow` and `--sort-by newest` still use the verified values.
-
-Set `GOZILLO_CACHE_DIR` to keep search and property caches separate from
-`GOZILLO_CONFIG_DIR`. This is useful when sessions remain isolated per run but
-cache entries should be reused across runs for their configured TTL.
-
-### Proxy
-
-```bash
-gozillo search \
-  --location "$LOCATION" \
-  --rent \
-  --tls-profile "$TLS_PROFILE" \
-  --proxy 'http://proxy.example:8080'
-```
-
-You can also use Go's standard `HTTPS_PROXY` and `NO_PROXY` environment
-variables.
-
-## Property details
-
-From a live URL:
-
-```bash
-gozillo --output=json property \
-  --session default \
-  --tls-profile "$TLS_PROFILE" \
-  'https://www.zillow.com/homedetails/.../123456_zpid/'
-```
-
-From saved HTML:
-
-```bash
-gozillo property ./property.html
-```
-
-## Offline snapshots
-
-Offline parsing does not require a TLS profile:
-
-```bash
-gozillo search --snapshot search.next.json --limit 20
-gozillo search --snapshot results.html --max-price 3000
-```
-
-## Output
-
-Set the global output mode before the command:
-
-```bash
-gozillo --output=table search ...
-gozillo --output=json search ...
-gozillo --output=jsonl search ...
-```
-
-For multi-location JSONL, each record contains either a listing or a location
-error:
-
-```json
-{"location":"Example City ST","listing":{}}
-{"location":"Another City ST","error":"..."}
-```
-
-When available, listings also include `requiredMonthlyFees`,
-`totalMonthlyCost`, verification notes, `historyStatus`, and meaningful
-`historyChanges`. Community-expanded units may not expose `daysOnZillow`. `--verify-recency`
-performs a second, non-destructive unit-page pass. When an individual unit page
-exposes the current rental cycle in `priceHistory`, gozillo derives
-listed/updated dates and exact calendar days; otherwise CSV exports label the
-value `Unknown`, explain the evidence gap, and record the last-checked date.
+For deeper discovery, filtering, property verification, proxies, streaming
+output, and history comparisons, see the [search guide](docs/search-guide.md).
 
 ## Commands
 
@@ -428,56 +122,41 @@ value `Unknown`, explain the evidence gap, and record the last-checked date.
 | `search` | Search locations, profiles, or saved snapshots |
 | `property` | Read normalized property details |
 | `session` | Import, inspect, list, and remove sessions |
-| `har` | Capture HARs through CDP, sanitize them, and derive direct-search profiles |
+| `har` | Capture HARs through CDP, sanitize them, and derive search profiles |
 | `version` | Print the CLI version |
 
-Run `gozillo <command> --help` for the full option list.
+Run `./gozillo <command> --help` for command usage, options, and available
+subcommands.
 
-## Sessions and privacy
+## Documentation
 
-- Session files are plaintext secrets stored with owner-only permissions.
-- Cookie values are never printed by `session list` or `session inspect`.
-- Browser identity is not imported automatically.
-- Response cookies live only for the current command and are not written back to
-  the session file.
-- Use one multi-location command when cookie continuity matters.
-- Remove sessions when finished:
+- [Browser session guide](docs/browser-session.md): CDP setup, HAR capture,
+  sanitization and import, browser identity, privacy, and connection
+  troubleshooting.
+- [Search guide](docs/search-guide.md): discovery routes, filters, property
+  details, proxies, offline snapshots, output, and coverage troubleshooting.
+- [Reverse-engineering notes](docs/reverse-engineering.md): transport, session,
+  parsing, privacy, and reliability invariants for contributors.
 
-  ```bash
-  gozillo session remove --name default
-  ```
+## Security and privacy
 
-## Troubleshooting
-
-### `--tls-profile is required`
-
-Every live search or property request needs an explicit browser profile. Offline
-snapshots and local HTML do not.
-
-### `X-Px-Blocked`
-
-Try a fresh HAR from a successful browser page load. Keep the captured
-User-Agent and allowlisted navigation headers exact. Start with the nearest
-browser-family TLS profile, but if it is rejected, test another profile while
-changing only that one variable. Avoid repeating the same failing routes across
-many separate commands.
-
-### Missing listings
-
-The default location search remains one rendered page. For deeper coverage,
-use bounded `--bed-range`, `--server-sort`, `--max-pages`, and `--home-type`
-routes. `--supplemental-no-laundry` covers amenity-index misses, and
-`--keyword-route` adds focused flex searches. Bounded location retries also
-apply to challenged or rate-limited route pages. Review stderr coverage warnings
-when a route has more reported pages than the configured cap. Zillow can still omit or change private website data.
+- Session files and raw HARs are plaintext secrets stored with owner-only
+  permissions on supported systems.
+- Browser identity is not imported automatically, and cookie values are not
+  printed by session inspection commands.
+- Keep CDP endpoints on loopback unless you deliberately opt into and trust an
+  exact remote WebSocket endpoint.
+- CDP capture records traffic; it does not bypass authentication, rate limits,
+  bot protections, or other access controls.
+- Use only session state and destinations that you are authorized to access.
+- Delete raw captures and remove imported sessions when they are no longer
+  needed.
 
 ## Development
 
 ```bash
-gofmt -w .
-go test ./...
-go vet ./...
+make check
 ```
 
-See [reverse-engineering notes](docs/reverse-engineering.md) for transport,
-session, and parsing details.
+Use `make help` to list focused build, formatting, test, race, vet, and data
+boundary targets. Run `make ci` when dependencies need to be downloaded first.
