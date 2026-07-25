@@ -363,7 +363,7 @@ gozillo search \
   --location "$LOCATION" \
   --rent \
   --tls-profile "$TLS_PROFILE" \
-  --proxy 'http://user:password@proxy.example:8080'
+  --proxy 'http://proxy.example:8080'
 ```
 
 You can also use Go's standard `HTTPS_PROXY` and `NO_PROXY` environment
