@@ -135,7 +135,7 @@ subcommands.
   troubleshooting.
 - [Search guide](docs/search-guide.md): discovery routes, filters, property
   details, proxies, offline snapshots, output, and coverage troubleshooting.
-- [Reverse-engineering notes](docs/reverse-engineering.md): transport, session,
+- [Request discovery notes](docs/request-discovery.md): transport, session,
   parsing, privacy, and reliability invariants for contributors.
 
 ## Security and privacy

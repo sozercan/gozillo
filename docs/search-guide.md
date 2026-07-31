@@ -221,4 +221,4 @@ configured cap. Zillow can still omit or change private website data.
 
 Run `./gozillo search --help` and `./gozillo property --help` for the complete
 option reference. Contributor-facing implementation details are in the
-[reverse-engineering notes](reverse-engineering.md).
+[request discovery notes](request-discovery.md).
