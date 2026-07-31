@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   test:
-    name: Go checks
+    name: Test and build
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -26,50 +26,74 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: 1
           persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
-          cache: false
-
-      - name: Check repository data boundary
-        shell: bash
-        run: |
-          forbidden="$(
-            git ls-files \
-              | grep -E '(^|/)(captures|reports)/|\.raw\.har$|(^|/)zillow\.har$' \
-              || true
-          )"
-          if [[ -n "$forbidden" ]]; then
-            printf 'Forbidden raw or generated data is tracked:\n%s\n' "$forbidden"
-            exit 1
-          fi
+          cache: true
+          cache-dependency-path: go.sum
 
       - name: Download modules
-        run: go mod download
+        run: make deps
+
+      - name: Check repository data boundary
+        run: make data-boundary
 
       - name: Verify modules
-        run: go mod verify
+        run: make mod-verify
 
       - name: Check formatting
-        shell: bash
-        run: |
-          files="$(gofmt -l .)"
-          if [[ -n "$files" ]]; then
-            printf 'The following files need gofmt:\n%s\n' "$files"
-            exit 1
-          fi
+        run: make fmt-check
+
+      - name: Check scripts
+        run: make scripts-check
 
       - name: Vet
-        run: go vet ./...
+        run: make vet
 
       - name: Test with race detector
-        run: go test -race -count=1 ./...
+        run: make test-race
 
       - name: Build CLI
-        run: go build -trimpath -o "${RUNNER_TEMP}/gozillo" ./cmd/gozillo
+        run: make build BINARY="${RUNNER_TEMP}/gozillo"
+
+  platform:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - windows-latest
+
+    env:
+      GOFLAGS: -mod=readonly
+      GOTOOLCHAIN: local
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Test
+        run: go test -count=1 ./...
+
+      - name: Build CLI
+        run: go build -trimpath ./cmd/gozillo

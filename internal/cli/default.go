@@ -1,6 +1,7 @@
 package cli
 
-const Version = "0.1.0"
+// Version is the CLI version. Release builds override it with -ldflags -X.
+var Version = "0.1.0"
 
 // DefaultCommands returns the production command set.
 func DefaultCommands() []Command {
