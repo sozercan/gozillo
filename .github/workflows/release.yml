@@ -91,7 +91,7 @@ jobs:
                 -ldflags "-s -w -X gozillo/internal/cli.Version=${VERSION}" \
                 -o "${stage}/${binary}" \
                 ./cmd/gozillo
-            cp README.md "${stage}/README.md"
+            cp README.md LICENSE "${stage}/"
 
             if [[ "${target}" == "linux/amd64" ]]; then
               actual="$("${stage}/${binary}" version)"
