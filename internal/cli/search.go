@@ -327,7 +327,7 @@ func (searchCommand) Run(ctx Context, args []string) error {
 	requestContext := context.Background()
 	var client *zillow.Client
 	if profileSet || locationSet || detailOptions.needsEnrichment() {
-		client, err = newZillowTransport(Version, zillowTransportOptions{
+		client, err = newZillowTransport(currentVersion(), zillowTransportOptions{
 			Timeout:        *timeout,
 			ProxyURL:       *proxyValue,
 			SessionName:    *sessionName,

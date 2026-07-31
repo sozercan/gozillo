@@ -23,7 +23,7 @@ func TestVersionCommand(t *testing.T) {
 	if code != ExitOK {
 		t.Fatalf("Execute(version) code = %d, stderr = %q", code, stderr.String())
 	}
-	if stdout.String() != "gozillo "+Version+"\n" {
+	if stdout.String() != "gozillo "+currentVersion()+"\n" {
 		t.Fatalf("version output = %q", stdout.String())
 	}
 }

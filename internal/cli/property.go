@@ -53,7 +53,7 @@ func (propertyCommand) Run(ctx Context, args []string) error {
 		if strings.TrimSpace(*tlsProfile) == "" {
 			return usagef("property --tls-profile is required for URL input")
 		}
-		client, clientErr := newZillowTransport(Version, zillowTransportOptions{
+		client, clientErr := newZillowTransport(currentVersion(), zillowTransportOptions{
 			Timeout:        *timeout,
 			ProxyURL:       *proxyValue,
 			SessionName:    *sessionName,

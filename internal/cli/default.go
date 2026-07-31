@@ -1,8 +1,5 @@
 package cli
 
-// Version is the CLI version. Release builds override it with -ldflags -X.
-var Version = "0.1.0"
-
 // DefaultCommands returns the production command set.
 func DefaultCommands() []Command {
 	return []Command{
@@ -19,6 +16,6 @@ type versionCommand struct{}
 func (versionCommand) Name() string    { return "version" }
 func (versionCommand) Summary() string { return "Print the gozillo version" }
 func (versionCommand) Run(ctx Context, _ []string) error {
-	_, err := ctx.Stdout.Write([]byte("gozillo " + Version + "\n"))
+	_, err := ctx.Stdout.Write([]byte("gozillo " + currentVersion() + "\n"))
 	return err
 }
