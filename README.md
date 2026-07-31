@@ -160,7 +160,3 @@ make check
 
 Use `make help` to list focused build, formatting, test, race, vet, and data
 boundary targets. Run `make ci` when dependencies need to be downloaded first.
-
-## License
-
-`gozillo` is licensed under the [MIT License](LICENSE).
