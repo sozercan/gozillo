@@ -15,7 +15,7 @@ producing table, JSON, or JSONL output.
 
 Zillow endpoints are private and unsupported. Preserve the project's bounded,
 conservative request behavior, partial-result handling, and explicit security
-boundaries. Read `README.md` and `docs/reverse-engineering.md` before changing
+boundaries. Read `README.md` and `docs/request-discovery.md` before changing
 transport, session, search, discovery, property parsing, or HAR capture logic.
 
 ## Repository map
@@ -99,7 +99,7 @@ During iteration, run focused tests such as `go test ./internal/zillow` or
 - Sign commits with `git commit -s`.
 - Do not prefix PR titles with `[codex]`.
 - Open PRs ready for review unless the user explicitly requests a draft.
-- Keep changes focused. Update `README.md` or `docs/reverse-engineering.md` when
+- Keep changes focused. Update `README.md` or `docs/request-discovery.md` when
   user-facing behavior or documented transport/session invariants change.
 
 ## Definition of done
