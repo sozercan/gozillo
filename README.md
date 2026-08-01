@@ -29,7 +29,12 @@ reuse cookies from a fresh browser HAR capture.
 
 ## Install
 
-Requires Go 1.24.1 or newer.
+Prebuilt archives for Linux, macOS, and Windows are available from
+[GitHub Releases](https://github.com/sozercan/gozillo/releases). Each release
+includes amd64 and arm64 builds. Verify the selected archive against
+`checksums.txt` before extracting it.
+
+To build from source, Go 1.24.1 or newer is required.
 
 ```bash
 make build

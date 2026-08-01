@@ -19,9 +19,10 @@ func currentVersion() string {
 func resolveVersion(linkedVersion, moduleVersion string) string {
 	for _, candidate := range []string{linkedVersion, moduleVersion} {
 		candidate = strings.TrimSpace(candidate)
-		if candidate != "" {
-			return strings.TrimPrefix(candidate, "v")
+		if candidate == "" || candidate == "(devel)" {
+			continue
 		}
+		return strings.TrimPrefix(candidate, "v")
 	}
-	return "unknown"
+	return "dev"
 }

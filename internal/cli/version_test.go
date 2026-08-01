@@ -29,13 +29,13 @@ func TestResolveVersion(t *testing.T) {
 			want:          "2.0.0",
 		},
 		{
-			name:          "development build",
+			name:          "development build marker",
 			moduleVersion: "(devel)",
-			want:          "(devel)",
+			want:          "dev",
 		},
 		{
 			name: "missing build information",
-			want: "unknown",
+			want: "dev",
 		},
 	}
 
