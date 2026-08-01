@@ -1,7 +1,5 @@
 package cli
 
-const Version = "0.1.0"
-
 // DefaultCommands returns the production command set.
 func DefaultCommands() []Command {
 	return []Command{
@@ -13,11 +11,17 @@ func DefaultCommands() []Command {
 	}
 }
 
-type versionCommand struct{}
+type versionCommand struct {
+	version string
+}
 
 func (versionCommand) Name() string    { return "version" }
 func (versionCommand) Summary() string { return "Print the gozillo version" }
-func (versionCommand) Run(ctx Context, _ []string) error {
-	_, err := ctx.Stdout.Write([]byte("gozillo " + Version + "\n"))
+func (command versionCommand) Run(ctx Context, _ []string) error {
+	version := command.version
+	if version == "" {
+		version = currentVersion()
+	}
+	_, err := ctx.Stdout.Write([]byte(Name + " " + version + "\n"))
 	return err
 }

@@ -19,12 +19,15 @@ func TestVersionCommand(t *testing.T) {
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	code := Execute([]string{"version"}, &stdout, &stderr)
+	code := Execute([]string{"version"}, &stdout, &stderr, versionCommand{version: "fixture-version"})
 	if code != ExitOK {
 		t.Fatalf("Execute(version) code = %d, stderr = %q", code, stderr.String())
 	}
-	if stdout.String() != "gozillo "+Version+"\n" {
+	if stdout.String() != "gozillo fixture-version\n" {
 		t.Fatalf("version output = %q", stdout.String())
+	}
+	if stderr.String() != "" {
+		t.Fatalf("version stderr = %q, want empty", stderr.String())
 	}
 }
 

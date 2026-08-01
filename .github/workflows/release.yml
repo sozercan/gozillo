@@ -1,0 +1,138 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Test, build, and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    env:
+      GOFLAGS: -mod=readonly
+      GOTOOLCHAIN: local
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Validate release tag
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="${GITHUB_REF_NAME}"
+          semver_pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(\+([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?$'
+          if [[ ! "${tag}" =~ ${semver_pattern} ]]; then
+            printf 'Release tag must be valid Semantic Versioning with a v prefix; got %s\n' "${tag}" >&2
+            exit 1
+          fi
+
+          printf 'version=%s\n' "${tag#v}" >> "${GITHUB_OUTPUT}"
+
+      - name: Run CI checks
+        run: make ci BINARY="${RUNNER_TEMP}/gozillo-check"
+
+      - name: Build release archives
+        shell: bash
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+          targets=(
+            linux/amd64
+            linux/arm64
+            darwin/amd64
+            darwin/arm64
+            windows/amd64
+            windows/arm64
+          )
+
+          for target in "${targets[@]}"; do
+            goos="${target%/*}"
+            goarch="${target#*/}"
+            package="gozillo_${VERSION}_${goos}_${goarch}"
+            stage="${RUNNER_TEMP}/${package}"
+            binary="gozillo"
+
+            if [[ "${goos}" == "windows" ]]; then
+              binary="gozillo.exe"
+            fi
+
+            mkdir -p "${stage}"
+            CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" \
+              go build \
+                -trimpath \
+                -ldflags "-s -w -X gozillo/internal/cli.buildVersion=${VERSION}" \
+                -o "${stage}/${binary}" \
+                ./cmd/gozillo
+            cp README.md LICENSE "${stage}/"
+            cp -R docs assets "${stage}/"
+
+            if [[ "${target}" == "linux/amd64" ]]; then
+              actual="$("${stage}/${binary}" version)"
+              expected="gozillo ${VERSION}"
+              if [[ "${actual}" != "${expected}" ]]; then
+                printf 'Version check failed: got %q, want %q\n' "${actual}" "${expected}" >&2
+                exit 1
+              fi
+            fi
+
+            if [[ "${goos}" == "windows" ]]; then
+              (
+                cd "${RUNNER_TEMP}"
+                zip -q -X -r "${GITHUB_WORKSPACE}/dist/${package}.zip" "${package}"
+              )
+            else
+              tar -C "${RUNNER_TEMP}" -czf "dist/${package}.tar.gz" "${package}"
+            fi
+          done
+
+          (
+            cd dist
+            sha256sum gozillo_* > checksums.txt
+          )
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          release_args=(
+            --verify-tag
+            --generate-notes
+            --title "${GITHUB_REF_NAME}"
+          )
+          version_without_build="${GITHUB_REF_NAME%%+*}"
+          if [[ "${version_without_build}" == *-* ]]; then
+            release_args+=(--prerelease)
+          fi
+
+          gh release create "${GITHUB_REF_NAME}" "${release_args[@]}" dist/*

@@ -83,7 +83,7 @@ func runHARCapture(ctx Context, args []string) error {
 		IncludeResponseBodies: *responseBodies,
 		AllowRemoteEndpoint:   *allowRemote,
 		CreatorName:           Name,
-		CreatorVersion:        Version,
+		CreatorVersion:        currentVersion(),
 	})
 	if err != nil {
 		return err

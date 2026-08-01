@@ -1,0 +1,2 @@
+# Golden fixtures are byte-compared and must retain canonical LF endings.
+internal/har/testdata/* text eol=lf
