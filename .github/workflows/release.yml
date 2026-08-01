@@ -92,6 +92,7 @@ jobs:
                 -o "${stage}/${binary}" \
                 ./cmd/gozillo
             cp README.md LICENSE "${stage}/"
+            cp -R docs assets "${stage}/"
 
             if [[ "${target}" == "linux/amd64" ]]; then
               actual="$("${stage}/${binary}" version)"

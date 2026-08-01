@@ -22,6 +22,6 @@ func (command versionCommand) Run(ctx Context, _ []string) error {
 	if version == "" {
 		version = currentVersion()
 	}
-	_, err := ctx.Stdout.Write([]byte("gozillo " + version + "\n"))
+	_, err := ctx.Stdout.Write([]byte(Name + " " + version + "\n"))
 	return err
 }
