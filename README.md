@@ -13,9 +13,18 @@ information, and prints table, JSON, or JSONL output. Live requests use a
 [`tls-client`](https://github.com/bogdanfinn/tls-client) browser profile and can
 reuse cookies from a fresh browser HAR capture.
 
-> Zillow's website endpoints are private and unsupported. They may change
-> without notice. Use the tool conservatively and respect the site's terms,
-> rate limits, and access controls.
+## Disclaimer
+
+`gozillo` is an independent project intended for educational and research
+purposes. It is not affiliated with, endorsed by, or sponsored by Zillow or
+Zillow Group. All trademarks, including Zillow, belong to their respective
+owners.
+
+This tool is provided "as is", with no guarantee of functionality, availability,
+or data accuracy. Zillow's website endpoints are private and unsupported. They
+may change or become unavailable without notice, and this tool may stop working
+at any time. Use it conservatively and at your own risk, and respect the site's
+terms, rate limits, and access controls.
 
 ## Features
 
